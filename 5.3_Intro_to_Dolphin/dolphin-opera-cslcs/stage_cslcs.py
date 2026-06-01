@@ -17,7 +17,7 @@ Example (the call used for the Three Sisters tutorial tarball):
     python stage_cslcs.py \\
         --bursts T115-245676-IW2 T115-245677-IW2 \\
         --start 2016-07-01 --end 2024-07-01 \\
-        --bbox 587970 4866930 609090 4890530 \\
+        --bbox 587950 4866900 609130 4890550 \\
         --gnss-stations HUSB PMAR \\
         --tarball three-sisters-cslc.tar.gz \\
         --out three_sisters/data/
@@ -66,15 +66,24 @@ def download(bursts, start, end, out_dir):
     import asf_search as asf
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # asf_search expects burst IDs with underscores (T115_245676_IW2),
+    # but OPERA filenames use dashes (T115-245676-IW2). Accept either
+    # from the user and convert.
+    burst_ids = [b.replace("-", "_") for b in bursts]
+
     results = asf.search(
         processingLevel=asf.PRODUCT_TYPE.CSLC,
-        operaBurstID=list(bursts),
-        start=start, end=end,
+        operaBurstID=burst_ids,
+        start=f"{start}T00:00:00Z",
+        end=f"{end}T00:00:00Z",
     )
     print(f"ASF returned {len(results)} CSLCs")
-    results.download_all(
+    # ASFSession() auto-picks up ~/.netrc credentials via requests'
+    # standard netrc handling — no explicit auth call needed.
+    results.download(
         path=str(out_dir),
-        session=asf.ASFSession().auth_with_netrc(),
+        session=asf.ASFSession(),
+        processes=4,
     )
 
 

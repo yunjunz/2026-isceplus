@@ -174,7 +174,7 @@ code(r"""
 # !python stage_cslcs.py \
 #     --bursts T115-245676-IW2 T115-245677-IW2 \
 #     --start 2016-07-01 --end 2024-07-01 \
-#     --bbox 587970 4866930 609090 4890530 \
+#     --bbox 587950 4866900 609130 4890550 \
 #     --out three_sisters/data/
 """)
 
