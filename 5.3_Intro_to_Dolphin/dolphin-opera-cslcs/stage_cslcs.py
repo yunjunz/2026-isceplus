@@ -8,9 +8,14 @@ End-to-end one-shot prep:
      <out>/slc_tif/.
   3. Stitch per-burst SLCs onto one common grid per acquisition under
      <out>/slc_stitched/.
-  4. (Optional) Download daily ENU tenv3 GNSS time series from UNR-NGL
+  4. (Optional) Drop acquisitions in months passed via --exclude-months
+     so you can filter out snow-decorrelated winter/spring scenes.
+  5. (Optional) Download daily ENU tenv3 GNSS time series from UNR-NGL
      to <out>/gnss/ for any stations passed via --gnss-stations.
-  5. (Optional) Tar+gzip everything into one .tar.gz at --tarball PATH.
+  6. (Optional) Tar+gzip everything into one .tar.gz at --tarball PATH.
+     Use --tarball-include to fold in extra paths (e.g. pre-computed
+     dolphin/unwrapped/ and a temp_coh raster) so the shipped archive
+     covers everything the notebook reads.
 
 Example (the call used for the Three Sisters tutorial tarball):
 
@@ -18,8 +23,11 @@ Example (the call used for the Three Sisters tutorial tarball):
         --bursts T115-245676-IW2 T115-245677-IW2 \\
         --start 2016-07-01 --end 2024-07-01 \\
         --bbox 587950 4866900 609130 4890550 \\
+        --exclude-months 11 12 1 2 3 4 \\
         --gnss-stations HUSB PMAR \\
         --tarball three-sisters-cslc.tar.gz \\
+        --tarball-include three_sisters/dolphin/unwrapped \\
+                          three_sisters/dolphin/interferograms/temporal_coherence_average_20160722_20240622.tif \\
         --out three_sisters/data/
 
 --bbox is UTM (xmin ymin xmax ymax) in the burst's native CRS.
@@ -56,8 +64,21 @@ def parse_args():
     ap.add_argument("--gnss-stations", nargs="*", default=[],
                      help="UNR-NGL station codes to download .tenv3 series for "
                           "(e.g. HUSB PMAR). Goes to <out>/gnss/.")
+    ap.add_argument("--exclude-months", nargs="*", type=int, default=[],
+                     metavar="MM",
+                     help="Month numbers (1-12) to drop after download. "
+                          "Use for season filtering: e.g. `--exclude-months "
+                          "11 12 1 2 3 4` drops winter and spring scenes "
+                          "that decorrelate over snow.")
     ap.add_argument("--tarball", type=Path, default=None,
                      help="If set, tar+gzip <out>/ to this path when done.")
+    ap.add_argument("--tarball-include", nargs="*", type=Path, default=[],
+                     help="Extra paths (files or dirs) to fold into the "
+                          "tarball alongside <out>/. Use this to ship "
+                          "pre-computed dolphin outputs (unwrapped ifgs + "
+                          "temporal_coherence_average) so students can run "
+                          "the time-series inversion without first having "
+                          "to run dolphin themselves.")
     return ap.parse_args()
 
 
@@ -184,12 +205,51 @@ def fetch_gnss(stations: list[str], out_dir: Path) -> None:
         print(f"    -> {out.stat().st_size/1e6:.1f} MB")
 
 
-def build_tarball(src_dir: Path, dest: Path) -> None:
-    """tar+gzip src_dir into dest, preserving the src_dir basename inside."""
-    print(f"building {dest.name} from {src_dir}/ ...")
+def build_tarball(src_dir: Path, dest: Path,
+                   extras: list[Path] | None = None) -> None:
+    """tar+gzip src_dir + extras into dest.
+
+    src_dir goes in under its basename. Each path in extras is added under
+    its basename too (so dolphin/unwrapped/ becomes ./unwrapped/ in the
+    archive).
+    """
+    extras = extras or []
+    print(f"building {dest.name} from {src_dir}/ "
+          f"+ {len(extras)} extra path(s) ...")
     with tarfile.open(dest, "w:gz", compresslevel=6) as tar:
         tar.add(src_dir, arcname=src_dir.name)
+        for p in extras:
+            tar.add(p, arcname=p.name)
     print(f"  tarball: {dest.stat().st_size/1e6:.0f} MB at {dest}")
+
+
+def filter_by_month(out_dir: Path, exclude_months: list[int]) -> None:
+    """Delete any cropped/staged outputs whose acquisition month is excluded.
+
+    Run after the H5 → tif crop and after the per-burst stitch. Removes:
+      - <out>/OPERA_L2_CSLC-*.h5 for excluded months
+      - <out>/slc_tif/{burst}_{YYYYMMDD}.slc.tif for excluded months
+      - <out>/slc_stitched/{YYYYMMDD}.slc.tif for excluded months
+    """
+    if not exclude_months:
+        return
+    excluded = {int(m) for m in exclude_months}
+    print(f"dropping acquisitions in months {sorted(excluded)} ...")
+    removed = 0
+    for h5 in out_dir.glob("OPERA_L2_CSLC-S1_*.h5"):
+        _, yyyymmdd = parse_acquisition(h5.name)
+        if int(yyyymmdd[4:6]) in excluded:
+            h5.unlink()
+            removed += 1
+    for tif in (out_dir / "slc_tif").glob("*_*.slc.tif"):
+        if int(tif.stem.split("_")[1][4:6]) in excluded:
+            tif.unlink()
+            removed += 1
+    for tif in (out_dir / "slc_stitched").glob("*.slc.tif"):
+        if int(tif.stem[4:6]) in excluded:
+            tif.unlink()
+            removed += 1
+    print(f"  removed {removed} files")
 
 
 def main():
@@ -213,13 +273,16 @@ def main():
     # 3) Stitch the per-burst SLCs into one tif per acquisition.
     stitch_bursts_per_date(out_dir / "slc_tif", out_dir / "slc_stitched")
 
-    # 4) Optional GNSS time series from UNR-NGL.
+    # 4) Optional season/month filter (e.g. drop winter scenes).
+    filter_by_month(out_dir, args.exclude_months)
+
+    # 5) Optional GNSS time series from UNR-NGL.
     if args.gnss_stations:
         fetch_gnss(args.gnss_stations, out_dir / "gnss")
 
-    # 5) Optional tarball.
+    # 6) Optional tarball (with any --tarball-include extras folded in).
     if args.tarball is not None:
-        build_tarball(out_dir, args.tarball)
+        build_tarball(out_dir, args.tarball, args.tarball_include)
 
     print("done.")
 
