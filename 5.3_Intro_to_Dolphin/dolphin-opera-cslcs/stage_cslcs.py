@@ -23,7 +23,7 @@ Example (the call used for the Three Sisters tutorial tarball):
         --bursts T115-245676-IW2 T115-245677-IW2 \\
         --start 2016-07-01 --end 2024-07-01 \\
         --bbox 587950 4866900 609130 4890550 \\
-        --exclude-months 11 12 1 2 3 4 \\
+        --exclude-months 11 12 1 2 3 4 5 \\
         --gnss-stations HUSB PMAR \\
         --tarball three-sisters-cslc.tar.gz \\
         --tarball-include three_sisters/dolphin/unwrapped \\
@@ -82,12 +82,40 @@ def parse_args():
     return ap.parse_args()
 
 
+def _excluded_to_season(exclude_months):
+    """If exclude_months forms a contiguous winter band (wrapping year-end),
+    return [start_doy, end_doy] for the kept summer band. Else None.
+
+    Examples:
+      [11,12,1,2,3,4,5] excluded -> [6,7,8,9,10] kept -> [152, 304]
+      [12,1,2]          excluded -> [3,..,11]   kept -> [60, 334]
+      [6,7]             excluded -> [1..5,8..12] kept -> not contiguous -> None
+    """
+    from datetime import date
+    if not exclude_months:
+        return None
+    excluded = {int(m) for m in exclude_months}
+    kept = [m for m in range(1, 13) if m not in excluded]
+    # Kept months must form a contiguous run not wrapping the year
+    # (otherwise it's the EXCLUDED set that wraps, which is the
+    # common case for winter filtering and what we want).
+    if kept != list(range(min(kept), max(kept) + 1)):
+        return None
+    start_doy = date(2001, min(kept), 1).timetuple().tm_yday
+    # End-of-month for max(kept): use day 1 of next month minus 1 day,
+    # or just last day of that month directly.
+    import calendar
+    last_day = calendar.monthrange(2001, max(kept))[1]
+    end_doy = date(2001, max(kept), last_day).timetuple().tm_yday
+    return [start_doy, end_doy]
+
+
 def download(bursts, start, end, out_dir, exclude_months=None):
     """Pull the OPERA CSLCs from ASF DAAC into out_dir.
 
-    If exclude_months is given, drop matching scenes from the search
-    results before downloading — avoids wasting bandwidth on scenes
-    we'd delete anyway in the season-filter step.
+    If exclude_months forms a contiguous winter band, uses asf_search's
+    built-in season= filter (server-side) to skip those scenes. The
+    post-download filter_by_month() call is still belt-and-suspenders.
     """
     import asf_search as asf
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -97,24 +125,19 @@ def download(bursts, start, end, out_dir, exclude_months=None):
     # from the user and convert.
     burst_ids = [b.replace("-", "_") for b in bursts]
 
+    season = _excluded_to_season(exclude_months)
+    if season:
+        print(f"  using asf_search season=[{season[0]}, {season[1]}] "
+              f"(DOY) to skip excluded months server-side")
+
     results = asf.search(
         processingLevel=asf.PRODUCT_TYPE.CSLC,
         operaBurstID=burst_ids,
         start=f"{start}T00:00:00Z",
         end=f"{end}T00:00:00Z",
+        season=season,
     )
-    print(f"ASF returned {len(results)} CSLCs in date range")
-
-    if exclude_months:
-        excluded = {int(m) for m in exclude_months}
-        kept = [r for r in results
-                if int(r.properties["fileName"].split("_")[4][4:6])
-                   not in excluded]
-        print(f"  dropping {len(results) - len(kept)} scenes in "
-              f"excluded months {sorted(excluded)}")
-        results = asf.ASFSearchResults(kept)
-
-    print(f"downloading {len(results)} CSLCs ...")
+    print(f"ASF returned {len(results)} CSLCs to download")
     # ASFSession() auto-picks up ~/.netrc credentials via requests'
     # standard netrc handling — no explicit auth call needed.
     results.download(
@@ -242,21 +265,15 @@ def build_tarball(src_dir: Path, dest: Path,
 def filter_by_month(out_dir: Path, exclude_months: list[int]) -> None:
     """Delete any cropped/staged outputs whose acquisition month is excluded.
 
-    Run after the H5 → tif crop and after the per-burst stitch. Removes:
-      - <out>/OPERA_L2_CSLC-*.h5 for excluded months
-      - <out>/slc_tif/{burst}_{YYYYMMDD}.slc.tif for excluded months
-      - <out>/slc_stitched/{YYYYMMDD}.slc.tif for excluded months
+    Run after the H5 → tif crop and after the per-burst stitch. The
+    pre-download season filter already skips most of these; this is
+    just belt-and-suspenders for any that snuck through.
     """
     if not exclude_months:
         return
     excluded = {int(m) for m in exclude_months}
     print(f"dropping acquisitions in months {sorted(excluded)} ...")
     removed = 0
-    for h5 in out_dir.glob("OPERA_L2_CSLC-S1_*.h5"):
-        _, yyyymmdd = parse_acquisition(h5.name)
-        if int(yyyymmdd[4:6]) in excluded:
-            h5.unlink()
-            removed += 1
     for tif in (out_dir / "slc_tif").glob("*_*.slc.tif"):
         if int(tif.stem.split("_")[1][4:6]) in excluded:
             tif.unlink()
@@ -276,16 +293,18 @@ def main():
     download(args.bursts, args.start, args.end, out_dir,
               exclude_months=args.exclude_months)
 
-    # 2) Crop each H5 to a per-burst SLC geotiff under slc_tif/.
+    # 2) Crop each H5 to a per-burst SLC geotiff under slc_tif/, then
+    #    delete the raw H5 so the staged directory stays compact (we
+    #    don't keep the metadata layers around).
     h5s = sorted(out_dir.glob("OPERA_L2_CSLC-S1_*.h5"))
     print(f"cropping {len(h5s)} H5s to bbox {args.bbox}")
     for h5 in h5s:
         burst, yyyymmdd = parse_acquisition(h5.name)
         tif = out_dir / "slc_tif" / f"{burst}_{yyyymmdd}.slc.tif"
-        if tif.exists():
-            continue
-        crop_h5_to_tif(h5, tuple(args.bbox), tif)
-        print(f"  {tif.relative_to(out_dir)}")
+        if not tif.exists():
+            crop_h5_to_tif(h5, tuple(args.bbox), tif)
+            print(f"  {tif.relative_to(out_dir)}")
+        h5.unlink()
 
     # 3) Stitch the per-burst SLCs into one tif per acquisition.
     stitch_bursts_per_date(out_dir / "slc_tif", out_dir / "slc_stitched")

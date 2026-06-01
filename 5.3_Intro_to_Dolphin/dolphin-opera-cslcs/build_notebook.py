@@ -66,12 +66,15 @@ mm/yr since the late 1990s. We'll use dolphin to recover that signal
 from Sentinel-1 OPERA CSLCs.
 
 We use track 115, ascending, with two adjacent bursts covering the
-volcano: `T115-245676-IW2` and `T115-245677-IW2`. 105 acquisitions
-2016-07 to 2024-06, each cropped to the AOI (~1 GB total).
-**We deliberately filtered out winter acquisitions** when staging this
-stack — at the dome's elevation, snow cover collapses C-band coherence
-and contaminates the phase. Consider similar filtering for your own
-data (or a different sensor) if you work over snowy terrain.
+volcano: `T115-245676-IW2` and `T115-245677-IW2`. 95 acquisitions per
+burst between 2016-07 and 2024-06 (June-October only, see below),
+each cropped to the AOI (~1 GB total).
+**We kept only June-October acquisitions** when staging this stack —
+at the dome's elevation, snow cover from late autumn through late
+spring collapses C-band coherence and contaminates the phase. That
+leaves ~95 acquisitions/burst for the multi-year inversion. Consider
+similar filtering for your own data (or a different sensor) if you
+work over snowy terrain.
 
 GPS validation comes from two PBO stations: HUSB on the NW flank of
 the dome (UNR-NGL reports ~+4 mm/yr LOS uplift) and PMAR ~10 km south,
@@ -83,12 +86,19 @@ which we treat as the reference.
 [Staniewicz et al. 2025](https://arxiv.org/abs/2511.12051). The paper
 runs over a wider AOI; we work on a smaller two-burst subset that
 covers the HUSB and PMAR GPS stations shown in the inset, mainly to
-keep the time series inversion tractable. The bottom panel — dolphin
-LOS (orange) vs HUSB GPS (blue) — is the kind of GPS-vs-dolphin
-agreement to aim for.*
+keep the time series inversion tractable.*
 
 By the end you'll know what each stage of dolphin produces, how to
 read its QA outputs, and which parameters matter.
+""")
+
+md(r"""
+## 0. Notebook prep
+
+We start with the housekeeping: where the data comes from, how the
+full pipeline runs in production, and a few imports. The three actual
+processing steps (PS / phase linking, unwrap, inversion) are Sections
+1, 2, and 3 below.
 """)
 
 code(r"""
@@ -121,21 +131,21 @@ print(f"dolphin {dolphin.__version__}")
 # ===========================================================================
 
 md(r"""
-## 0. Notebook prep
-
-We start with the housekeeping: where the data comes from, how the
-full pipeline runs in production, and a few imports. The three actual
-processing steps (PS / phase linking, unwrap, inversion) are Sections
-1, 2, and 3 below.
-
 ### 0.1 Input data
 
 dolphin works on **any stack of coregistered SLCs**. As long as every
 acquisition has been resampled onto the same pixel grid, dolphin doesn't
-care where the data came from — OPERA CSLCs, ISCE2 `topsApp` outputs,
+care where the data came from — OPERA CSLCs, ISCE3 outputs,
 GAMMA, your own pipeline, etc. That flexibility is one of dolphin's
 strengths: it focuses purely on phase estimation, leaving SAR processing
-and coregistration to whatever upstream tool you prefer.
+to whatever upstream tool you prefer.
+
+dolphin assumes the upstream tool already did the usual SLC
+preprocessing: sub-pixel coregistration so the same (i, j) in every
+SLC is the same ground point, and topographic phase removal so what
+you're left with is just deformation + atmosphere + noise. OPERA CSLCs
+arrive with both done; if you bring SLCs from another pipeline you're
+responsible for getting them into that state first.
 
 For this notebook we use **OPERA L2 CSLCs**: per-burst, per-acquisition
 HDF5 files holding a geocoded complex SLC, produced from Sentinel-1 SAFE
@@ -144,11 +154,14 @@ given burst is already coregistered to the same UTM grid.
 
 ### Get the staged data
 
-We've pre-staged the 210 CSLCs (105 dates × 2 bursts), the per-epoch
-cropped geotiffs, **the burst-stitched geotiffs** (one complex SLC
-per acquisition, both bursts already merged onto one UTM grid under
-`data/slc_stitched/`), and the GNSS data into a single tarball on S3.
-Pull it down and extract once:
+We've pre-staged the 95 acquisitions per burst as per-burst cropped
+geotiffs under `data/slc_tif/`, **plus the burst-stitched geotiffs**
+(one complex SLC per acquisition, both bursts merged onto one UTM
+grid under `data/slc_stitched/`), plus the GNSS data, into a single
+tarball on S3. The raw OPERA H5s aren't shipped — the cropped tifs
+have the complex SLC values dolphin needs, and shipping the H5s would
+balloon the tarball by 20× for metadata we don't use here. Pull the
+tarball down and extract once:
 """)
 
 code(r"""
@@ -1405,6 +1418,14 @@ the real thing:
   snaphu defaults.
 - **Reference pixel was hardcoded** to PMAR. Production dolphin can
   auto-pick a high-quality reference using the `quality_file` raster.
+- **No atmospheric corrections.** dolphin has both
+  `dolphin.workflows.corrections.estimate_ionospheric_delay()` (split-
+  spectrum, from JPL TEC maps) and a tropospheric correction step
+  (consumes ERA5 / HRRR / GACOS / RAiDER zenith delay files). Both are
+  off by default; you opt in by passing TEC and/or weather-model
+  files in the displacement-workflow config. We didn't run either, so
+  the velocity map here includes whatever residual atmospheric
+  signal survives the multi-year L1 inversion's averaging.
 
 A few things worth doing on your own scene:
 
