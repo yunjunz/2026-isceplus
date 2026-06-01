@@ -1370,9 +1370,10 @@ on its own. A quick recap of the three stages:
 
 - **Step 1 — PS / phase linking.** Use amplitude statistics ($\mu_A$,
   $\sigma_A$) to classify pixels and to find SHP neighborhoods for the
-  noisy DS ones. dolphin estimates a noise-mitigated phase per acquisition
-  for every pixel and writes per-pixel temporal coherence telling you
-  how trustworthy that estimate is.
+  noisy DS ones. dolphin estimates a noise-mitigated phase per
+  acquisition for every pixel and writes per-pixel temporal coherence
+  telling you how closely the recovered phase matches the observed
+  phases.
 - **Step 2 — Unwrap.** Form ifgs over a network of acquisition pairs
   and recover the integer cycle count at each pixel. snaphu is the
   default; spurt is the option for noisier scenes.
@@ -1380,6 +1381,30 @@ on its own. A quick recap of the three stages:
   network into a linear system and solve with L1 so the occasional
   bad ifg doesn't smear bias through the whole time series. Pin a
   reference epoch and (optionally) a reference pixel.
+
+A few things we skipped or simplified, so you know where to look for
+the real thing:
+
+- **Burst stitching happens in dolphin.** We pre-stitched the two
+  bursts in `stage_cslcs.py` to keep the notebook running on a single
+  combined stack. Production dolphin runs PS + PL per burst
+  (`t115_*` subdirs in `dolphin/`) and uses `dolphin.stitching` to
+  merge unwrapped ifgs onto a common grid afterwards.
+- **We unwrapped one ifg, not a network.** A real `dolphin run`
+  unwraps the entire bandwidth-3 network (~300 ifgs for this stack),
+  with optional Goldstein preprocessing and per-ifg conncomp QA. Our
+  §3.3 inversion reads those pre-computed unwraps from the shipped
+  tarball.
+- **One ministack, no compressed-SLC chaining.** Production dolphin
+  runs phase linking in sequential ministacks (~10-20 acquisitions
+  each) and chains them via compressed SLCs to keep memory bounded
+  on long stacks. We collapsed to a single 15-acquisition ministack
+  for simplicity.
+- **Only L1 + snaphu.** We mentioned phass, ICU, spurt, and
+  whirlwind, and we mentioned the L2 option, but only ran the L1 +
+  snaphu defaults.
+- **Reference pixel was hardcoded** to PMAR. Production dolphin can
+  auto-pick a high-quality reference using the `quality_file` raster.
 
 A few things worth doing on your own scene:
 

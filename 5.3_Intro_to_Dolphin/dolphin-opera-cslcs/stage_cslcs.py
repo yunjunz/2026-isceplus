@@ -82,8 +82,13 @@ def parse_args():
     return ap.parse_args()
 
 
-def download(bursts, start, end, out_dir):
-    """Pull the OPERA CSLCs from ASF DAAC into out_dir."""
+def download(bursts, start, end, out_dir, exclude_months=None):
+    """Pull the OPERA CSLCs from ASF DAAC into out_dir.
+
+    If exclude_months is given, drop matching scenes from the search
+    results before downloading — avoids wasting bandwidth on scenes
+    we'd delete anyway in the season-filter step.
+    """
     import asf_search as asf
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -98,7 +103,18 @@ def download(bursts, start, end, out_dir):
         start=f"{start}T00:00:00Z",
         end=f"{end}T00:00:00Z",
     )
-    print(f"ASF returned {len(results)} CSLCs")
+    print(f"ASF returned {len(results)} CSLCs in date range")
+
+    if exclude_months:
+        excluded = {int(m) for m in exclude_months}
+        kept = [r for r in results
+                if int(r.properties["fileName"].split("_")[4][4:6])
+                   not in excluded]
+        print(f"  dropping {len(results) - len(kept)} scenes in "
+              f"excluded months {sorted(excluded)}")
+        results = asf.ASFSearchResults(kept)
+
+    print(f"downloading {len(results)} CSLCs ...")
     # ASFSession() auto-picks up ~/.netrc credentials via requests'
     # standard netrc handling — no explicit auth call needed.
     results.download(
@@ -257,7 +273,8 @@ def main():
     out_dir = args.out
 
     # 1) Download (skipped per-file by asf_search if already on disk).
-    download(args.bursts, args.start, args.end, out_dir)
+    download(args.bursts, args.start, args.end, out_dir,
+              exclude_months=args.exclude_months)
 
     # 2) Crop each H5 to a per-burst SLC geotiff under slc_tif/.
     h5s = sorted(out_dir.glob("OPERA_L2_CSLC-S1_*.h5"))
