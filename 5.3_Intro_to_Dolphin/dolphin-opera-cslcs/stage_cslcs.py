@@ -25,7 +25,7 @@ Example (the call used for the Three Sisters tutorial tarball):
         --bbox 587950 4866900 609130 4890550 \\
         --exclude-months 11 12 1 2 3 4 5 \\
         --gnss-stations HUSB PMAR \\
-        --tarball three-sisters-cslc.tar.gz \\
+        --tarball three-sisters-cslc.tar \\
         --tarball-include three_sisters/dolphin/unwrapped \\
                           three_sisters/dolphin/interferograms/temporal_coherence_average_20160722_20240622.tif \\
         --out three_sisters/data/
@@ -246,17 +246,34 @@ def fetch_gnss(stations: list[str], out_dir: Path) -> None:
 
 def build_tarball(src_dir: Path, dest: Path,
                    extras: list[Path] | None = None) -> None:
-    """tar+gzip src_dir + extras into dest.
+    """tar src_dir + extras into dest. No gzip - the .slc.tifs are
+    already deflate-compressed inside, so gzipping them again costs
+    ~10 min of CPU for ~25% size reduction. We also exclude the
+    intermediate per-burst slc_tif/ dir since the notebook only
+    needs slc_stitched/.
 
-    src_dir goes in under its basename. Each path in extras is added under
-    its basename too (so dolphin/unwrapped/ becomes ./unwrapped/ in the
-    archive).
+    src_dir goes in under its basename. Each path in extras is added
+    under its basename too.
     """
     extras = extras or []
+    exclude_dirs = {"slc_tif"}              # only stitched + gnss ship
+    def _filter(info):
+        rel = Path(info.name).relative_to(src_dir.name)
+        # Drop the per-burst slc_tif/ intermediate dir.
+        if rel.parts and rel.parts[0] in exclude_dirs:
+            return None
+        # Defensive: also skip any raw OPERA H5s sitting at the top of
+        # data/. Current pipeline already deletes them post-crop; this
+        # protects re-tars against stale ones from older runs.
+        if rel.suffix == ".h5":
+            return None
+        return info
+
     print(f"building {dest.name} from {src_dir}/ "
+          f"(excluding {sorted(exclude_dirs)} + *.h5) "
           f"+ {len(extras)} extra path(s) ...")
-    with tarfile.open(dest, "w:gz", compresslevel=6) as tar:
-        tar.add(src_dir, arcname=src_dir.name)
+    with tarfile.open(dest, "w") as tar:
+        tar.add(src_dir, arcname=src_dir.name, filter=_filter)
         for p in extras:
             tar.add(p, arcname=p.name)
     print(f"  tarball: {dest.stat().st_size/1e6:.0f} MB at {dest}")

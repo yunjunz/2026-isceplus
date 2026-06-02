@@ -110,11 +110,7 @@ import matplotlib.pyplot as plt
 import xarray as xr
 
 HERE = Path.cwd()
-
-DATA         = HERE / "three_sisters" / "data"
-SLC_PER_BURST = DATA / "slc_tif"          # per-burst per-acquisition SLCs
-SLC_STITCHED = DATA / "slc_stitched"      # both bursts merged per acquisition
-WORK         = HERE / "three_sisters" / "notebook_work"
+WORK = HERE / "three_sisters" / "notebook_work"
 WORK.mkdir(parents=True, exist_ok=True)
 
 BURSTS = ["T115-245676-IW2", "T115-245677-IW2"]
@@ -154,22 +150,20 @@ given burst is already coregistered to the same UTM grid.
 
 ### Get the staged data
 
-We've pre-staged the 95 acquisitions per burst as per-burst cropped
-geotiffs under `data/slc_tif/`, **plus the burst-stitched geotiffs**
-(one complex SLC per acquisition, both bursts merged onto one UTM
-grid under `data/slc_stitched/`), plus the GNSS data, into a single
-tarball on S3. The raw OPERA H5s aren't shipped — the cropped tifs
-have the complex SLC values dolphin needs, and shipping the H5s would
-balloon the tarball by 20× for metadata we don't use here. Pull the
-tarball down and extract once:
+We've pre-staged the **burst-stitched complex SLC geotiffs** (one per
+acquisition, both bursts merged onto one UTM grid under
+`data/slc_stitched/`) plus the GNSS time series, into a single
+tarball on S3. The raw OPERA H5s and the per-burst intermediate
+tifs aren't shipped — the notebook only reads the stitched tifs.
+Pull the tarball down and extract once:
 """)
 
 code(r"""
 # Placeholder - replace this URL with the actual S3 path once uploaded.
-S3_URL = "s3://earthscope-course-data/three-sisters-cslc.tar.gz"
+S3_URL = "s3://earthscope-course-data/three-sisters-cslc.tar"
 
-# !aws s3 cp $S3_URL three-sisters-cslc.tar.gz --no-sign-request
-# !tar -xzf three-sisters-cslc.tar.gz -C three_sisters/
+# !aws s3 cp $S3_URL three-sisters-cslc.tar --no-sign-request
+# !tar -xf three-sisters-cslc.tar -C three_sisters/
 """)
 
 md(r"""
@@ -218,9 +212,13 @@ In production dolphin is two commands. First you generate a config YAML
 that points at your inputs and sets every knob you care about:
 
 ```bash
-dolphin config --slc-files three_sisters/data/*.h5 --subdataset /data/VV \
+dolphin config --slc-files three_sisters/data/slc_stitched/*.slc.tif \
     --strides 12 6  --max-bandwidth 3  --unwrap-method snaphu
 ```
+
+(If your inputs were raw OPERA HDF5s instead of the stitched tifs the
+notebook ships, you'd also pass `--subdataset /data/VV` so dolphin
+knows which dataset inside the H5 to read.)
 
 `dolphin config` with no flags would write a sensible default YAML for
 the given inputs. CLI flags let you override the most-tuned knobs up
@@ -242,9 +240,9 @@ through each stage by hand so the YAML isn't a black box.
 code(r"""
 # The two commands we're NOT running. Uncomment to do the whole pipeline.
 #
-# 1) Generate a YAML pointing at our CSLCs (knobs via flags here, or
-#    leave defaults and hand-edit dolphin_config.yaml afterwards):
-# !dolphin config --slc-files three_sisters/data/*.h5 --subdataset /data/VV
+# 1) Generate a YAML pointing at the stitched SLC tifs we shipped
+#    (knobs via flags, or leave defaults and hand-edit afterwards):
+# !dolphin config --slc-files three_sisters/data/slc_stitched/*.slc.tif
 #
 # 2) Run the pipeline:
 # !dolphin run dolphin_config.yaml
@@ -325,7 +323,8 @@ We just hand dolphin the stitched file list.
 """)
 
 code(r"""
-slc_tifs = sorted(SLC_STITCHED.glob("*.slc.tif"))
+slc_tifs = sorted((HERE / "three_sisters" / "data" / "slc_stitched")
+                    .glob("*.slc.tif"))
 print(f"{len(slc_tifs)} stitched SLC tifs")
 """)
 
@@ -489,11 +488,15 @@ plain boxcar multilook.
 For each DS-classified pixel, dolphin sweeps a fixed search window
 (`half_window`, e.g. 11 in azimuth × 5 in range for OPERA's asymmetric
 pixel posting) and applies the test pairwise. Each DS pixel ends up
-with its own SHP set. dolphin then groups those SHPs together and
-estimates the most likely noise-mitigated phase from their combined noisy
-observations, returning one cleaned phase per acquisition (the EMI
-estimator — Ansari, De Zan, Bamler 2018 — does this by solving an
-eigenvalue problem on the group's coherence matrix).
+with its own SHP set. dolphin then averages complex coherence across
+those SHPs to build an $N \times N$ sample coherence matrix at the
+centre pixel and recovers one phase per acquisition from it.
+
+The estimator dolphin uses is **EMI** (Ansari et al. 2018). It picks
+the per-acquisition phase that best explains every observed pairwise
+phase difference, weighting high-coherence pairs more than noisy
+ones. Mechanically, it's the **dominant eigenvector** of the
+SHP-pooled coherence matrix.
 """)
 
 code(r"""
@@ -535,12 +538,23 @@ print(f"{len(pl_slcs)} phase-linked SLCs, temp_coh raster = {temp_coh.name}")
 md(r"""
 ### 1.7 Temporal coherence — how good was the fit?
 
-For each pixel, dolphin's temporal coherence measures how similar the
-recovered noise-mitigated phase is to the observed noisy phases.
-Values near 1 mean the estimator fit the observations well; values
-below ~0.5 mean it didn't, and any downstream product over those
-pixels is unreliable. We use this raster to mask the final velocity
-in Section 3.
+For each pixel, dolphin's temporal coherence measures **how
+self-consistent the recovered phase is with the SHP-pooled coherence
+matrix it came from**. Mechanically: take the recovered phase
+$\hat\varphi$, predict the phase difference $\hat\varphi_j -
+\hat\varphi_i$ for every acquisition pair, and compare those to the
+phase differences in the SHP-averaged complex coherence matrix
+$C_{ij}$. The closer the match, the closer $\gamma_{\rm temp}$ is to 1.
+
+The comparison is **against the SHP-pooled coherence**, not against
+the raw single-pixel observations — those are too noisy to compare
+against pair-by-pair. Spatial averaging across the SHP cloud is what
+gives the comparison something stable to test against.
+
+Values near 1 mean the estimator's solution is consistent with the
+SHP-pooled inputs; values below ~0.5 mean it isn't, and any
+downstream product over those pixels is unreliable. We use this
+raster to mask the final velocity in Section 3.
 
 A quick terminology note: "coherence" gets used two different ways in
 InSAR.
@@ -571,14 +585,15 @@ plt.show()
 md(r"""
 What does "high vs low temp_coh" look like at one pixel? We could pull
 two real pixels from the stack, but $2\pi$ wrapping makes the
-comparison hard to read (the high-tc pixel's smooth phase trend wraps
-around the same as the low-tc pixel's random walk). It's clearer with
-**synthetic** time series:
+comparison hard to read. It's clearer as a **synthetic** demo:
 
-- High tc → recovered phase tracks a small deformation signal with a
-  tight noise envelope (the model fit the observations well).
-- Low tc → recovered phase wanders ±$\pi$ pretty much at random (the
-  model couldn't find a coherent signal).
+- High tc → recovered phase tracks a smooth underlying signal.
+- Low tc → recovered phase wanders ±$\pi$ pretty much at random.
+
+(Caveat: the plot below uses single-pixel "observed" points to keep
+the picture simple. The real $\gamma_{\rm temp}$ formula compares the
+recovered phase to the SHP-pooled coherence matrix as above, not to
+single-pixel observations — but the visual intuition is the same.)
 """)
 
 code(r"""
@@ -1274,7 +1289,8 @@ HUSB_LOS_UV = np.array([0.631870, -0.110014, 0.767227])
 
 # Read the UNR-NGL tenv3 file: whitespace-separated table with
 # YYYY.YYYY decimal year + east/north/up displacements in meters.
-husb = pd.read_csv(DATA / "gnss" / "HUSB.tenv3", sep=r"\s+")
+husb = pd.read_csv(HERE / "three_sisters" / "data" / "gnss" / "HUSB.tenv3",
+                    sep=r"\s+")
 gps_t   = husb["yyyy.yyyy"].values
 gps_los = (husb["__east(m)"]  * HUSB_LOS_UV[0]
            + husb["_north(m)"] * HUSB_LOS_UV[1]
@@ -1385,8 +1401,8 @@ on its own. A quick recap of the three stages:
   $\sigma_A$) to classify pixels and to find SHP neighborhoods for the
   noisy DS ones. dolphin estimates a noise-mitigated phase per
   acquisition for every pixel and writes per-pixel temporal coherence
-  telling you how closely the recovered phase matches the observed
-  phases.
+  telling you how self-consistent the recovered phase is with the
+  SHP-pooled coherence matrix it was derived from.
 - **Step 2 — Unwrap.** Form ifgs over a network of acquisition pairs
   and recover the integer cycle count at each pixel. snaphu is the
   default; spurt is the option for noisier scenes.
