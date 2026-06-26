@@ -20,7 +20,9 @@ from pathlib import Path
 import nbformat as nbf
 
 HERE = Path(__file__).resolve().parent
-OUT = HERE / "dolphin-three-sisters-cslcs.ipynb"
+# This script lives in staging/; the notebook and its figures live one
+# level up in the package root, so write the .ipynb there.
+OUT = HERE.parent / "dolphin-three-sisters-cslcs.ipynb"
 
 cells: list = []
 
