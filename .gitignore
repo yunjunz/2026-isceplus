@@ -2,3 +2,5 @@
 */.ipynb_checkpoints/*
 *.DS_Store
 .vscode
+install.md
+environment.yml

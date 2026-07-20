@@ -1400,17 +1400,15 @@ def multilook_nearest(arr, az_looks, rg_looks):
         return arr[:, ::az_looks, ::rg_looks]
 
 
-def stitch_los_tiff(process_cslc_dir, burst_id_list, date_ymd, output_path,
+def stitch_los_tiff(process_cslc_dir, burst_id_list, date_ymd,
                     out_gt=None, out_shape=None,
                     az_looks=1, rg_looks=1):
-    """Stitch LOS angles from multiple static-layer bursts into a 2-band GeoTIFF.
+    """Stitch LOS angles from multiple static-layer bursts into two arrays.
 
     Computes incidence and azimuth angles from per-burst static-layer HDF5
     files, multilooks each burst (nearest-neighbour), then stitches the
     bands independently via :func:`stitch_arrays`.  The result is optionally
     cropped to match an existing interferogram extent.
-
-    Band 1 = incidence angle (degrees), Band 2 = azimuth angle (degrees).
 
     Parameters
     ----------
@@ -1421,8 +1419,6 @@ def stitch_los_tiff(process_cslc_dir, burst_id_list, date_ymd, output_path,
     date_ymd : str
         Acquisition date string ``YYYYMMDD`` for locating the static-layer
         HDF5 file under ``<cslc_dir>/<burst_id>/<YYYYMMDD>/``.
-    output_path : str or Path
-        Output GeoTIFF file path.
     out_gt : tuple, optional
         GDAL geotransform ``(x0, dx, 0, y0, 0, dy)`` of the target output
         grid. If provided, the stitched LOS is cropped to this grid.
@@ -1437,14 +1433,16 @@ def stitch_los_tiff(process_cslc_dir, burst_id_list, date_ymd, output_path,
 
     Returns
     -------
-    los_2band : np.ndarray (float32)
-        Stacked array ``[2, rows, cols]`` with Band 0 = incidence,
-        Band 1 = azimuth.
+    inc_stitched : np.ndarray (float32)
+        Stitched incidence angle array (degrees), shape ``(rows, cols)``.
+    az_stitched : np.ndarray (float32)
+        Stitched azimuth angle array (degrees), shape ``(rows, cols)``.
     final_gt : tuple
-        Geotransform of the output array.
+        Geotransform of the output arrays.
     epsg : int
         EPSG code of the projection.
     """
+
     process_cslc_dir = Path(process_cslc_dir)
 
     inc_pieces = []
@@ -1491,12 +1489,13 @@ def stitch_los_tiff(process_cslc_dir, burst_id_list, date_ymd, output_path,
         corners_x = [min(x0, x1), max(x0, x1), max(x0, x1), min(x0, x1)]
         corners_y = [max(y0, y1), max(y0, y1), min(y0, y1), min(y0, y1)]
     else:
-        # Union extent of all pieces
-        ux_all = []; uy_all = []
+        ux_all = []
+        uy_all = []
         for _, gt, _ in inc_pieces:
             x0, dx, _, y0, _, dy = gt
-            ux_all.extend([x0, x0 + inc_pieces[0][0].shape[1] * dx])
-            uy_all.extend([y0, y0 + inc_pieces[0][0].shape[0] * dy])
+            arr = inc_pieces[0][0]
+            ux_all.extend([x0, x0 + arr.shape[1] * dx])
+            uy_all.extend([y0, y0 + arr.shape[0] * dy])
         corners_x = [min(ux_all), max(ux_all), max(ux_all), min(ux_all)]
         corners_y = [max(uy_all), max(uy_all), min(uy_all), min(uy_all)]
 
@@ -1509,38 +1508,27 @@ def stitch_los_tiff(process_cslc_dir, burst_id_list, date_ymd, output_path,
     az_stitched, _, _ = stitch_arrays(
         az_pieces, bbox_wsen, dx=ml_dx, dy=ml_dy, epsg_utm=epsg, method='last')
 
-    los_2band = np.stack([inc_stitched, az_stitched], axis=0)
-
     # Crop to exact output grid if requested
     if out_gt is not None and out_shape is not None:
         rows, cols = out_shape
         ox, oy = out_gt[0], out_gt[3]
         px = int(round((ox - union_gt[0]) / union_gt[1]))
         py = int(round((oy - union_gt[3]) / union_gt[5]))
-        los_2band = los_2band[:, py:py + rows, px:px + cols]
+        inc_stitched = inc_stitched[py:py + rows, px:px + cols]
+        az_stitched = az_stitched[py:py + rows, px:px + cols]
         union_gt = (ox, union_gt[1], 0, oy, 0, union_gt[5])
 
-        if los_2band.shape[1] != rows or los_2band.shape[2] != cols:
-            result = np.full((2, rows, cols), np.nan, dtype=np.float32)
-            h = min(los_2band.shape[1], rows)
-            w = min(los_2band.shape[2], cols)
-            result[:, :h, :w] = los_2band[:, :h, :w]
-            los_2band = result
+        if inc_stitched.shape[0] != rows or inc_stitched.shape[1] != cols:
+            inc_padded = np.full((rows, cols), np.nan, dtype=np.float32)
+            az_padded  = np.full((rows, cols), np.nan, dtype=np.float32)
+            h = min(inc_stitched.shape[0], rows)
+            w = min(inc_stitched.shape[1], cols)
+            inc_padded[:h, :w] = inc_stitched[:h, :w]
+            az_padded[:h, :w]  = az_stitched[:h, :w]
+            inc_stitched = inc_padded
+            az_stitched  = az_padded
 
-    # Save 2-band GeoTIFF (skip when output_path is None)
-    if output_path is not None:
-        drv = gdal.GetDriverByName('GTiff')
-        ds = drv.Create(str(output_path), los_2band.shape[2], los_2band.shape[1],
-                        2, gdal.GDT_Float32, options=['COMPRESS=LZW'])
-        ds.SetGeoTransform(union_gt)
-        ds.SetProjection(srs.ExportToWkt())
-        ds.GetRasterBand(1).WriteArray(los_2band[0])
-        ds.GetRasterBand(1).SetDescription('incidence_angle')
-        ds.GetRasterBand(2).WriteArray(los_2band[1])
-        ds.GetRasterBand(2).SetDescription('azimuth_angle')
-        ds = None
-
-    return los_2band, union_gt, epsg
+    return inc_stitched, az_stitched, union_gt, epsg
 
 # ===================================================================
 # 8. Auxiliary dataset I/O
