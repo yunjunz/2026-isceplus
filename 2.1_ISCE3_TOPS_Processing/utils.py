@@ -1664,7 +1664,6 @@ def plot_geom_corrections(h5_path, burst_id='burst', date_str=''):
     date_str : str
         Date label for print output.
     """
-    import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
 
     aux = read_aux_datasets(h5_path)
@@ -1678,28 +1677,21 @@ def plot_geom_corrections(h5_path, burst_id='burst', date_str=''):
     print(f'  bistatic_delay            — mean: {bistatic.mean():.6f} s, '
           f'std: {bistatic.std():.6f} s')
 
+    extent = [sr[0], sr[-1], azt[-1], azt[0]]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-    im1 = ax1.imshow(geo_doppler, aspect='auto', cmap='RdBu_r',
-                     extent=[sr[0], sr[-1], azt[-1], azt[0]])
-    ax1.set_title('geometry_steering_doppler')
+    plot_data(ax1, geo_doppler, title='geometry_steering_doppler',
+              cmap='RdBu_r', extent=extent, cbar_label='Range shift (m)')
     ax1.set_xlabel('Slant range (m)')
     ax1.set_ylabel('Azimuth time (s)')
     ax1.xaxis.set_major_locator(ticker.MultipleLocator(20000))
-    cbar1 = plt.colorbar(im1, ax=ax1)
-    cbar1.set_label('Range shift (m)')
-
-    im2 = ax2.imshow(bistatic, aspect='auto', cmap='RdBu_r',
-                     extent=[sr[0], sr[-1], azt[-1], azt[0]])
-    ax2.set_title('bistatic_delay')
+    plot_data(ax2, bistatic, title='bistatic_delay',
+              cmap='RdBu_r', extent=extent, cbar_label='Azimuth shift (s)')
     ax2.set_xlabel('Slant range (m)')
     ax2.set_ylabel('Azimuth time (s)')
     ax2.xaxis.set_major_locator(ticker.MultipleLocator(20000))
-    cbar2 = plt.colorbar(im2, ax=ax2)
-    cbar2.set_label('Azimuth shift (s)')
-
     fig.suptitle('Geometry corrections — 2-D profiles', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.show()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    show_and_close()
 
 
 def plot_phys_corrections(h5_path, dem_path, burst_id='burst', date_str=''):
@@ -1716,8 +1708,6 @@ def plot_phys_corrections(h5_path, dem_path, burst_id='burst', date_str=''):
     date_str : str
         Date label for print output.
     """
-    import matplotlib.pyplot as plt
-
     aux = read_aux_datasets(h5_path)
     sr, azt = aux['slant_range'], aux['zero_doppler_time']
     tide_rg = aux['los_solid_earth_tides']
@@ -1733,25 +1723,23 @@ def plot_phys_corrections(h5_path, dem_path, burst_id='burst', date_str=''):
     print(f'  Static troposphere (LOS):    {np.nanmean(tropo_disp):.4f} m')
     print(f'  Weather-model tropo:         {np.nanmean(np.abs(tropo_tot)):.4f} m')
 
+    extent = [sr[0], sr[-1], azt[-1], azt[0]]
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     plot_items = [
-        ('los_solid_earth_tides',  tide_rg,    'm', 'RdBu_r'),
-        ('los_ionospheric_delay',  iono,       'm', 'RdBu_r'),
-        ('Static troposphere',     tropo_disp, 'm', 'RdBu_r'),
+        ('los_solid_earth_tides',  tide_rg,    'm'),
+        ('los_ionospheric_delay',  iono,       'm'),
+        ('Static troposphere',     tropo_disp, 'm'),
     ]
-    for ax, (name, data, unit, cmap) in zip(axes, plot_items):
-        im = ax.imshow(data, aspect='auto', cmap=cmap,
-                       extent=[sr[0], sr[-1], azt[-1], azt[0]])
-        ax.set_title(name)
+    for ax, (name, data, unit) in zip(axes, plot_items):
+        plot_data(ax, data, title=name, cmap='RdBu_r', extent=extent,
+                  cbar_label=f'Delay ({unit})', shrink=0.85)
         ax.set_xlabel('Slant range (m)')
         ax.set_ylabel('Azimuth time (s)')
         ax.ticklabel_format(axis='x', style='sci', scilimits=(0, 0))
-        cbar = plt.colorbar(im, ax=ax, shrink=0.85)
-        cbar.set_label(f'Delay ({unit})')
 
     fig.suptitle('Physical corrections', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.show()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    show_and_close()
 
 
 def plot_focus_corrections(h5_path, burst_id='burst', date_str=''):
@@ -1766,7 +1754,6 @@ def plot_focus_corrections(h5_path, burst_id='burst', date_str=''):
     date_str : str
         Date label for print output.
     """
-    import matplotlib.pyplot as plt
     import matplotlib.ticker as ticker
 
     aux = read_aux_datasets(h5_path)
@@ -1782,30 +1769,25 @@ def plot_focus_corrections(h5_path, burst_id='burst', date_str=''):
           f'std={np.nanstd(az_carrier):.2f} rad')
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-    im1 = ax1.imshow(fm_mismatch, aspect='auto', cmap='bwr',
-                     extent=[sr[0], sr[-1], azt[-1], azt[0]])
-    ax1.set_title('azimuth_fm_rate_mismatch')
+    plot_data(ax1, fm_mismatch, title='azimuth_fm_rate_mismatch',
+              cmap='bwr', extent=[sr[0], sr[-1], azt[-1], azt[0]],
+              cbar_label='Azimuth shift (s)')
     ax1.set_xlabel('Slant range (m)')
     ax1.set_ylabel('Azimuth time (s)')
     ax1.xaxis.set_major_locator(ticker.MultipleLocator(20000))
-    cbar1 = plt.colorbar(im1, ax=ax1)
-    cbar1.set_label('Azimuth shift (s)')
 
     ss_rg = slice(0, az_carrier.shape[1], 10)
     ss_az = slice(0, az_carrier.shape[0], 10)
-    im2 = ax2.imshow(az_carrier[ss_az, ss_rg], aspect='auto', cmap='twilight',
-                     extent=[x_utm[0], x_utm[-1], y_utm[-1], y_utm[0]])
-    ax2.set_title('azimuth_carrier_phase (10x subsampled)')
+    plot_data(ax2, az_carrier[ss_az, ss_rg], title='azimuth_carrier_phase (10x subsampled)',
+              cmap='twilight', extent=[x_utm[0], x_utm[-1], y_utm[-1], y_utm[0]],
+              cbar_label='Phase (rad)')
     ax2.set_xlabel(f'Easting (m, EPSG:{epsg})')
     ax2.set_ylabel(f'Northing (m, EPSG:{epsg})')
     ax2.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.0f'))
-    cbar2 = plt.colorbar(im2, ax=ax2)
-    cbar2.set_label('Phase (rad)')
 
     fig.suptitle('Focusing corrections — 2-D profiles', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.show()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    show_and_close()
 
 
 def load_water_mask(gt_ml, ml_shape, epsg_utm, wbd_dir=None):
@@ -2105,3 +2087,318 @@ def set_ax_pixel(ax):
     """
     ax.set_xlabel('Column (px)')
     ax.set_ylabel('Row (px)')
+
+
+# ===================================================================
+# Plotting: convenience functions for imshow + colorbar + title
+# ===================================================================
+
+def plot_data(ax, data, title=None, cmap='jet', vmin=None, vmax=None,
+              extent=None, aspect='auto', cbar_label=None, alpha=None,
+              origin='upper', shrink=0.8):
+    """Plot a 2-D array on *ax* with imshow, colorbar and title.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    data : np.ndarray   2-D array to display.
+    title : str, optional   Title text (no title when None).
+    cmap : str   Colormap name (default ``'jet'``).
+    vmin, vmax : float, optional   Imshow value range.
+    extent : list, optional   ``[left, right, bottom, top]`` for imshow.
+    aspect : str   Aspect ratio (default ``'auto'``).
+    cbar_label : str, optional   Colorbar label (no bar when None).
+    alpha : float, optional   Transparency.
+    origin : str   Image origin (default ``'upper'``).
+    shrink : float   Colorbar shrink factor.
+
+    Returns
+    -------
+    im : matplotlib.image.AxesImage
+    """
+    kw = dict(cmap=cmap, aspect=aspect, origin=origin, extent=extent)
+    if vmin is not None:
+        kw['vmin'] = vmin
+    if vmax is not None:
+        kw['vmax'] = vmax
+    if alpha is not None:
+        kw['alpha'] = alpha
+    im = ax.imshow(data, **kw)
+    if title is not None:
+        ax.set_title(title)
+    if cbar_label is not None:
+        plt.colorbar(im, ax=ax, label=cbar_label, shrink=shrink)
+    return im
+
+
+def plot_phase(ax, phase, title=None, extent=None, **kwargs):
+    """Plot wrapped phase with jet colormap (default -pi to pi).
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    phase : np.ndarray   2-D wrapped phase (radians).
+    title : str, optional
+    extent : list, optional   ``[left, right, bottom, top]``.
+    **kwargs   Passed to :func:`plot_data`.
+    """
+    kwargs.setdefault('cmap', 'jet')
+    kwargs.setdefault('vmin', -np.pi)
+    kwargs.setdefault('vmax', np.pi)
+    kwargs.setdefault('cbar_label', 'Phase (rad)')
+    return plot_data(ax, phase, title=title, extent=extent, **kwargs)
+
+
+def plot_amplitude(ax, amp_db, title=None, extent=None, **kwargs):
+    """Plot amplitude in dB with gray colormap.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    amp_db : np.ndarray   2-D amplitude in dB.
+    title : str, optional
+    extent : list, optional
+    **kwargs   Passed to :func:`plot_data`.
+    """
+    kwargs.setdefault('cmap', 'gray')
+    kwargs.setdefault('vmin', 30)
+    kwargs.setdefault('vmax', 45)
+    kwargs.setdefault('cbar_label', 'Amplitude (dB)')
+    return plot_data(ax, amp_db, title=title, extent=extent, **kwargs)
+
+
+def plot_coherence(ax, coh, title=None, extent=None, **kwargs):
+    """Plot coherence 0-1 with gray colormap.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    coh : np.ndarray   2-D coherence array, values in [0, 1].
+    title : str, optional
+    extent : list, optional
+    **kwargs   Passed to :func:`plot_data`.
+    """
+    kwargs.setdefault('cmap', 'gray')
+    kwargs.setdefault('vmin', 0)
+    kwargs.setdefault('vmax', 1)
+    kwargs.setdefault('cbar_label', 'γ')
+    return plot_data(ax, coh, title=title, extent=extent, **kwargs)
+
+
+def plot_los(ax, angle, title=None, extent=None, **kwargs):
+    """Plot LOS angle or incidence angle with viridis colormap.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    angle : np.ndarray   2-D angle in degrees.
+    title : str, optional
+    extent : list, optional
+    **kwargs   Passed to :func:`plot_data`.
+    """
+    kwargs.setdefault('cmap', 'viridis')
+    kwargs.setdefault('cbar_label', 'deg')
+    return plot_data(ax, angle, title=title, extent=extent, **kwargs)
+
+
+def plot_phase_over_hillshade(ax, phase, hillshade, title=None, extent=None,
+                               alpha=0.8, **kwargs):
+    """Plot phase overlay on a hillshade background.
+
+    Renders the hillshade in gray, then overlays the phase with
+    the given *alpha* transparency and jet colormap.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+    phase : np.ndarray   2-D phase array (radians).
+    hillshade : np.ndarray   2-D hillshade (0-1).
+    title : str, optional
+    extent : list, optional
+    alpha : float   Phase transparency (default 0.8).
+    **kwargs   Passed to :func:`plot_data` for the phase layer.
+    """
+    ax.imshow(hillshade, cmap='gray', extent=extent, origin='upper', vmin=0, vmax=1)
+    kwargs.setdefault('cmap', 'jet')
+    kwargs.setdefault('vmin', -np.pi)
+    kwargs.setdefault('vmax', np.pi)
+    kwargs.setdefault('cbar_label', 'Phase (rad)')
+    return plot_data(ax, phase, title=title, extent=extent, alpha=alpha, **kwargs)
+
+
+def show_and_close(fig=None):
+    """Display all figures and close them."""
+    plt.show()
+    plt.close('all')
+
+
+# ===================================================================
+# Composite plotting: full lifecycle from figsize to close
+# ===================================================================
+
+def _plot_two(data1, data2, *,
+              plot1=plot_data, kw1=None,
+              plot2=plot_data, kw2=None,
+              coord=None, epsg=None,
+              xlabel1=None, ylabel1=None,
+              xlabel2=None, ylabel2=None,
+              figsize=(8, 3), tight_layout=True, suptitle=None):
+    """Generic 1x2 panel plot (internal).
+
+    Parameters
+    ----------
+    data1, data2 : np.ndarray
+    plot1, plot2 : callable   Per-axis functions (plot_phase, plot_coherence, ...).
+    kw1, kw2 : dict, optional   Keyword arguments for each plotter.
+    coord : 'pixel', 'utm' or None   Coordinate axis formatting.
+    epsg : int   Required when coord='utm'.
+    xlabel1, ylabel1, xlabel2, ylabel2 : str, optional   Per-axis labels.
+    figsize : tuple
+    tight_layout : bool
+    suptitle : str, optional
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    k1 = kw1 if kw1 is not None else {}
+    k2 = kw2 if kw2 is not None else {}
+    plot1(ax1, data1, **k1)
+    plot2(ax2, data2, **k2)
+    if xlabel1 is not None:
+        ax1.set_xlabel(xlabel1)
+    if ylabel1 is not None:
+        ax1.set_ylabel(ylabel1)
+    if xlabel2 is not None:
+        ax2.set_xlabel(xlabel2)
+    if ylabel2 is not None:
+        ax2.set_ylabel(ylabel2)
+    if coord == 'pixel':
+        set_ax_pixel(ax1)
+        set_ax_pixel(ax2)
+    elif coord == 'utm':
+        set_ax_utm(ax1, epsg)
+        set_ax_utm(ax2, epsg)
+    if suptitle is not None:
+        plt.suptitle(suptitle, fontsize=12, fontweight='bold')
+    if tight_layout:
+        plt.tight_layout(rect=[0, 0, 1, 0.95] if suptitle else None)
+    show_and_close()
+
+
+def plot_amplitude_pair(amp1, amp2, title1, title2, ext1=None, ext2=None,
+                        xlabel1=None, ylabel1=None, xlabel2=None, ylabel2=None,
+                        figsize=(8, 4), suptitle=None):
+    """1x2: two amplitude panels (gray, dB)."""
+    _plot_two(amp1, amp2,
+              plot1=plot_amplitude, kw1=dict(title=title1, extent=ext1),
+              plot2=plot_amplitude, kw2=dict(title=title2, extent=ext2),
+              xlabel1=xlabel1, ylabel1=ylabel1,
+              xlabel2=xlabel2, ylabel2=ylabel2,
+              figsize=figsize, suptitle=suptitle)
+
+
+def plot_ifg_coherence(phase, coh, phase_extent=None, coh_extent=None,
+                       phase_title='Stitched interferogram (phase)',
+                       coh_title='Complex coherence (5x5 window)',
+                       figsize=(8, 3)):
+    """1x2: phase (jet) + coherence (gray), pixel coordinates."""
+    _plot_two(phase, coh,
+              plot1=plot_phase, kw1=dict(title=phase_title, extent=phase_extent),
+              plot2=plot_coherence, kw2=dict(title=coh_title, extent=coh_extent),
+              coord='pixel', figsize=figsize)
+
+
+def plot_phase_triple(ph1, ph2, ph3, title1, title2, title3,
+                      ext1=None, figsize=(8, 2)):
+    """1x3: three phase panels (jet), only last column has colorbar.
+
+    Parameters
+    ----------
+    ph1, ph2, ph3 : np.ndarray   Wrapped phase arrays (radians).
+    title1, title2, title3 : str   Panel titles.
+    ext1 : list, optional   Extent for panel 1 only.
+    figsize : tuple   Figure size.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=figsize, constrained_layout=True)
+    plot_phase(axes[0], ph1, title=title1, cbar_label=None, extent=ext1)
+    set_ax_pixel(axes[0])
+    plot_phase(axes[1], ph2, title=title2, cbar_label=None)
+    set_ax_pixel(axes[1])
+    plot_phase(axes[2], ph3, title=title3)
+    set_ax_pixel(axes[2])
+    show_and_close()
+
+
+def plot_coherence_pair(coh1, coh2, ext1=None, ext2=None,
+                        title1='Complex coherence',
+                        title2='Phase-sigma coherence',
+                        cbar_label1='\u03b3', cbar_label2='\u03b3_phsig',
+                        figsize=(8, 3)):
+    """1x2: two coherence panels (gray, 0-1), pixel coordinates."""
+    _plot_two(coh1, coh2,
+              plot1=plot_coherence, kw1=dict(title=title1, cbar_label=cbar_label1, extent=ext1),
+              plot2=plot_coherence, kw2=dict(title=title2, cbar_label=cbar_label2, extent=ext2),
+              coord='pixel', figsize=figsize)
+
+
+def plot_los_pair(inc, az, extent, epsg,
+                  inc_title='LOS Incidence Angle (deg)',
+                  az_title='LOS Azimuth Angle (deg)',
+                  figsize=(8, 3)):
+    """1x2: LOS incidence and azimuth angle (viridis), UTM coordinates."""
+    _plot_two(inc, az,
+              plot1=plot_los, kw1=dict(title=inc_title, extent=extent),
+              plot2=plot_los, kw2=dict(title=az_title, extent=extent),
+              coord='utm', epsg=epsg, figsize=figsize)
+
+
+def plot_phase_hillshade_pair(ph1, ph2, hillshade, extent_deg,
+                               title1='Wrapped interferogram',
+                               title2='Unwrapped phase',
+                               alpha1=0.8, alpha2=0.6,
+                               vmin1=None, vmax1=None,
+                               vmin2=None, vmax2=None,
+                               figsize=(8, 3), suptitle=None):
+    """1x2: phase overlays on hillshade, EPSG:4326 coordinates.
+
+    Parameters
+    ----------
+    ph1, ph2 : np.ndarray   Wrapped / unwrapped phase (radians).
+    hillshade : np.ndarray   Hillshade array [0, 1].
+    extent_deg : list   [lon_left, lon_right, lat_bottom, lat_top].
+    title1, title2 : str   Panel titles.
+    alpha1, alpha2 : float   Phase opacity.
+    vmin1, vmax1, vmin2, vmax2 : float, optional   Phase colour range.
+    figsize : tuple   Figure size.
+    suptitle : str, optional   Overall figure title.
+    """
+    import matplotlib.ticker as ticker
+    _vmin1 = vmin1 if vmin1 is not None else -np.pi
+    _vmax1 = vmax1 if vmax1 is not None else np.pi
+    _vmin2 = vmin2
+    _vmax2 = vmax2
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    plot_phase_over_hillshade(ax1, ph1, hillshade, title=title1,
+                               extent=extent_deg, alpha=alpha1,
+                               vmin=_vmin1, vmax=_vmax1)
+    ax1.set_xlabel('Longitude (\u00b0E)')
+    ax1.set_ylabel('Latitude (\u00b0N)')
+    ax1.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.3f'))
+    ax1.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.3f'))
+    plt.setp(ax1.get_xticklabels(), rotation=30, ha='right')
+
+    kw2 = dict(extent=extent_deg, alpha=alpha2)
+    if _vmin2 is not None:
+        kw2['vmin'] = _vmin2
+    if _vmax2 is not None:
+        kw2['vmax'] = _vmax2
+    plot_phase_over_hillshade(ax2, ph2, hillshade, title=title2, **kw2)
+    ax2.set_xlabel('Longitude (\u00b0E)')
+    ax2.set_ylabel('Latitude (\u00b0N)')
+    ax2.xaxis.set_major_formatter(ticker.FormatStrFormatter('%.3f'))
+    ax2.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.3f'))
+    plt.setp(ax2.get_xticklabels(), rotation=30, ha='right')
+
+    if suptitle is not None:
+        plt.suptitle(suptitle, fontsize=14, fontweight='bold')
+    plt.tight_layout(rect=[0, 0, 1, 0.95] if suptitle else None)
+    show_and_close()
