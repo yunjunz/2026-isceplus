@@ -1045,7 +1045,7 @@ def _s1_cslc_worker(args):
             stdout=lf, stderr=_sp.STDOUT).returncode
 
 
-def run_s1_cslc_parallel(tasks, n_workers=4):
+def run_s1_cslc_parallel(tasks, n_workers=2):
     """Run multiple s1_cslc.py jobs in parallel.
 
     Parameters
@@ -1123,7 +1123,7 @@ def generate_static_layers(burst_id_list, config_dir, process_dir,
         write_static_layers_config(str(src), str(dst))
         tasks.append((burst_id, dst, logs_dir / f'static_layers_{burst_id}.log'))
 
-    return run_s1_cslc_parallel(tasks, n_workers=4)
+    return run_s1_cslc_parallel(tasks, n_workers=2)
 
 def find_burst_inputs(ymd, safe_base, orbit_dir, tec_dir, burst_id=None):
     """Locate the SAFE, orbit (EOF) and TEC files for one acquisition date.
@@ -2402,3 +2402,99 @@ def plot_phase_hillshade_pair(ph1, ph2, hillshade, extent_deg,
         plt.suptitle(suptitle, fontsize=14, fontweight='bold')
     plt.tight_layout(rect=[0, 0, 1, 0.95] if suptitle else None)
     show_and_close()
+
+
+
+
+def download_static_layers(burst_id_list, process_dir, ref_ymd,
+                           bbox_wsen=None):
+    """Download OPERA CSLC-S1-STATIC products from ASF (fast, recommended).
+
+    Searches ASF's OPERA-S1 catalog and downloads pre-computed
+    CSLC-STATIC .h5 granules.  Much faster than generating static layers
+    locally via :func:`generate_static_layers`.
+
+    Parameters
+    ----------
+    burst_id_list : list of str
+        Burst identifiers, e.g. ``['t124_264305_iw2', ...]``.
+    process_dir : Path
+        Process directory root.
+    ref_ymd : str
+        Reference date ``YYYYMMDD`` used for directory naming only
+        (STATIC layers are date-independent).
+    bbox_wsen : tuple, optional
+        ``(west, south, east, north)`` bounding box used for the ASF
+        spatial filter.
+
+    Returns
+    -------
+    ok : int
+        Number of bursts successfully downloaded.
+    """
+    import asf_search
+
+    cslc_dir = Path(process_dir) / 'CSLC'
+    cslc_dir.mkdir(parents=True, exist_ok=True)
+
+    def _esa_to_opera(bid):
+        """t124_264305_iw2 -> T124-264305-IW2"""
+        p = str(bid).split('_')
+        return f'T{p[0][1:]}-{p[1]:0>6}-{p[2].upper()}'
+
+    wkt = None
+    if bbox_wsen is not None:
+        w, s, e, n = bbox_wsen
+        wkt = f'POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))'
+
+    print(f'Searching ASF for CSLC-STATIC products ({len(burst_id_list)} bursts)...')
+    results = asf_search.search(
+        dataset=asf_search.constants.DATASET.OPERA_S1,
+        processingLevel='CSLC-STATIC',
+        intersectsWith=wkt,
+        maxResults=200,
+    )
+
+    # Map OPERA burst ID part -> ASFProduct
+    # sceneName: OPERA_L2_CSLC-S1-STATIC_T124-264303-IW2_20140403_S1A_v1.0
+    by_burst = {}
+    for r in results:
+        parts = r.properties['sceneName'].split('_')
+        if len(parts) >= 4:
+            by_burst.setdefault(parts[3], r)  # "T124-264303-IW2"
+
+    print(f'  Found {len(by_burst)} unique STATIC granules')
+
+    ok = 0
+    for burst_id in burst_id_list:
+        opera_bid = _esa_to_opera(burst_id)
+        r = by_burst.get(opera_bid)
+        if r is None:
+            print(f'  {burst_id}: not on ASF, skip')
+            continue
+
+        dst_dir = cslc_dir / burst_id / ref_ymd
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst_path = dst_dir / f'static_layers_{burst_id}.h5'
+
+        if dst_path.exists():
+            print(f'  {burst_id}: exists, skip')
+            ok += 1
+            continue
+
+        print(f'  {burst_id}: downloading ... ', end='', flush=True)
+        try:
+            r.download(str(dst_dir))
+            # Rename to expected filename
+            downloads = sorted(dst_dir.glob('OPERA_L2_CSLC-S1-STATIC*.h5'))
+            if downloads:
+                dl = downloads[-1]
+                if dl != dst_path:
+                    dl.rename(dst_path)
+            ok += 1
+            print('done')
+        except Exception as e:
+            print(f'FAILED ({e})')
+
+    print(f'\nStatic layers: {ok}/{len(burst_id_list)} bursts ready')
+    return ok
