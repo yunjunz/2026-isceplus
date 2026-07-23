@@ -524,18 +524,31 @@ def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
     sample, _, proj_wkt = arrays_list[0]
     is_complex = np.issubdtype(sample.dtype, np.complexfloating)
 
-    # --- gdal_merge-style output extent: union of all source bounds ---
-    ulx = None; uly = None; lrx = None; lry = None
+    # --- union extent: proper min/max for both dy signs ---
     pieces = []
     for arr, gt, _ in arrays_list:
         x0, px_dx, _, y0, _, py_dy = gt
         x1 = x0 + arr.shape[1] * px_dx
         y1 = y0 + arr.shape[0] * py_dy
-        if ulx is None or x0 < ulx: ulx = x0
-        if lrx is None or x1 > lrx: lrx = x1
-        if uly is None or y0 > uly: uly = y0
-        if lry is None or y1 < lry: lry = y1
-        pieces.append({'arr': arr, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1})
+        pieces.append({
+            'arr': arr, 'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1,
+            'x_min': min(x0, x1), 'x_max': max(x0, x1),
+            'y_min': min(y0, y1), 'y_max': max(y0, y1),
+            'dx': px_dx, 'dy': py_dy,
+        })
+
+    if not pieces:
+        raise ValueError("No valid pieces")
+
+    # Use dx/dy from first piece
+    dx = pieces[0]['dx']
+    dy = pieces[0]['dy']
+
+    # Proper geographic extent (north=max_y, south=min_y, east=max_x, west=min_x)
+    ulx = min(p['x_min'] for p in pieces)
+    lrx = max(p['x_max'] for p in pieces)
+    uly = max(p['y_max'] for p in pieces)
+    lry = min(p['y_min'] for p in pieces)
 
     # Clip to bbox_wsen
     tf = Transformer.from_crs('EPSG:4326', f'EPSG:{epsg_utm}', always_xy=True)
@@ -551,10 +564,14 @@ def stitch_arrays(arrays_list, bbox_wsen, dx=5.0, dy=-10.0, epsg_utm=32605,
     uly = min(uly, bbox_ymax)
     lry = max(lry, bbox_ymin)
 
-    # Output grid (gdal_merge.py style: int((extent / ps) + 0.5))
-    out_cols = int((lrx - ulx) / dx + 0.5)
-    out_rows = int((lry - uly) / dy + 0.5)
-    out_gt = (ulx, dx, 0, uly, 0, dy)
+    # Output grid (gdal_merge style: int((extent / ps) + 0.5))
+    # Use abs() for dimensions — works for both dy signs
+    out_cols = int((lrx - ulx) / abs(dx) + 0.5)
+    out_rows = int((uly - lry) / abs(dy) + 0.5)
+    # Standard GDAL convention: dy negative (north-up)
+    out_dy = -abs(dy)
+    out_dx = abs(dx)
+    out_gt = (ulx, out_dx, 0, uly, 0, out_dy)
 
     stitched = np.zeros((out_rows, out_cols), dtype=sample.dtype)
 
@@ -1189,7 +1206,7 @@ def find_burst_inputs(ymd, safe_base, orbit_dir, tec_dir, burst_id=None):
     # Prefer an orbit whose validity window covers the date (POEORB), else RESORB.
     orbit_path = None
     for eof in sorted(str(p) for p in orbit_dir.glob('*.EOF')):
-        m = re.search(r'V(\d{8})T\d{6}_(\d{8})T\d{6}', eof)
+        m = re.search(r'V(\d{8}T\d{6})_(\d{8}T\d{6})', eof)
         if m and m.group(1) <= ymd <= m.group(2):
             orbit_path = eof
             break
@@ -2497,4 +2514,1472 @@ def download_static_layers(burst_id_list, process_dir, ref_ymd,
             print(f'FAILED ({e})')
 
     print(f'\nStatic layers: {ok}/{len(burst_id_list)} bursts ready')
+    return ok
+# ===================================================================
+# 8. SARForge pipeline replacements - single-file operations
+# ===================================================================
+
+def get_file_geo_metadata(tif_path):
+    """Read GDAL geotransform, projection, shape and EPSG from a GeoTIFF.
+
+    Parameters
+    ----------
+    tif_path : str or Path
+
+    Returns
+    -------
+    gt : tuple  GDAL geotransform (x0, dx, 0, y0, 0, dy).
+    proj_wkt : str
+    shape : tuple (rows, cols)
+    epsg : int or None
+    """
+    ds = gdal.Open(str(tif_path))
+    if ds is None:
+        raise FileNotFoundError(f'Cannot open {tif_path}')
+    gt = ds.GetGeoTransform()
+    proj_wkt = ds.GetProjection()
+    shape = (ds.RasterYSize, ds.RasterXSize)
+    epsg = None
+    if proj_wkt:
+        srs = osr.SpatialReference()
+        srs.ImportFromWkt(proj_wkt)
+        epsg = srs.GetAttrValue('AUTHORITY', 1)
+        if epsg is not None:
+            epsg = int(epsg)
+    ds = None
+    return gt, proj_wkt, shape, epsg
+
+
+def _get_hdf5_geo_metadata(h5_path, subdataset='/data/VV'):
+    """Read coordinate vectors and EPSG from an OPERA CSLC HDF5 file.
+
+    Returns (x_coords, y_coords, epsg, shape).
+    """
+    with h5py.File(h5_path, 'r') as f:
+        x = f['/data/x_coordinates'][:]
+        y = f['/data/y_coordinates'][:]
+        epsg = int(f['/data/projection'][()])
+        shape = f[subdataset].shape
+    return x, y, epsg, shape
+
+
+def crop_slc_single(input_file, output_file, wsen, buffer=0.0,
+                    fill_nan=False, subdataset='/data/VV'):
+    """Crop a single SLC file (HDF5 or GeoTIFF) to WSEN bounds + buffer.
+
+    Reads only the overlapping region from the input and writes a compact
+    GeoTIFF covering the intersection area.
+
+    Parameters
+    ----------
+    input_file : str or Path
+        Input file (HDF5 or GeoTIFF).
+    output_file : str or Path
+        Output cropped GeoTIFF.
+    wsen : tuple
+        (west, south, east, north) in EPSG:4326.
+    buffer : float
+        Buffer to add around wsen in degrees.
+    fill_nan : bool
+        Fill NaN values with 0.
+    subdataset : str
+        HDF5 subdataset path (for HDF5 inputs).
+
+    Returns
+    -------
+    bool
+        True on success, False on failure.
+    """
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists():
+        print(f'  skip (exists): {output_file.name}')
+        return True
+
+    # Apply buffer
+    wsen_buf = (wsen[0] - buffer, wsen[1] - buffer,
+                wsen[2] + buffer, wsen[3] + buffer)
+
+    input_file_str = str(input_file)
+
+    if input_file_str.endswith('.h5') or input_file_str.endswith('.hdf5'):
+        return _crop_hdf5(input_file_str, str(output_file), wsen_buf,
+                          subdataset, fill_nan)
+    else:
+        return _crop_geotiff(input_file_str, str(output_file), wsen_buf)
+
+
+def _crop_hdf5(h5_path, output_path, wsen_buf, subdataset, fill_nan):
+    """Crop HDF5 file: read only the overlap region, write GeoTIFF."""
+    try:
+        x_coords, y_coords, epsg, shape = _get_hdf5_geo_metadata(
+            h5_path, subdataset)
+    except Exception as e:
+        print(f'  ERROR reading HDF5 {h5_path}: {e}')
+        return False
+
+    # Transform wsen to native CRS
+    if epsg and epsg != 4326:
+        src_srs = osr.SpatialReference(); src_srs.ImportFromEPSG(4326)
+        dst_srs = osr.SpatialReference(); dst_srs.ImportFromEPSG(int(epsg))
+        t = osr.CoordinateTransformation(src_srs, dst_srs)
+        corners = [
+            t.TransformPoint(wsen_buf[1], wsen_buf[0]),  # SW  (lat,lon)
+            t.TransformPoint(wsen_buf[3], wsen_buf[0]),  # NW
+            t.TransformPoint(wsen_buf[3], wsen_buf[2]),  # NE
+            t.TransformPoint(wsen_buf[1], wsen_buf[2]),  # SE
+        ]
+        native_W = min(c[0] for c in corners)
+        native_E = max(c[0] for c in corners)
+        native_S = min(c[1] for c in corners)
+        native_N = max(c[1] for c in corners)
+    else:
+        native_W, native_S, native_E, native_N = wsen_buf
+
+    # Find pixel range in native coordinates
+    col_mask = (x_coords >= native_W) & (x_coords <= native_E)
+    row_mask = (y_coords >= native_S) & (y_coords <= native_N)
+    if not np.any(col_mask) or not np.any(row_mask):
+        print(f'  skip (no overlap): {Path(h5_path).name}')
+        return True
+
+    cols = np.where(col_mask)[0]
+    rows = np.where(row_mask)[0]
+    c0, c1 = int(cols[0]), int(cols[-1]) + 1
+    r0, r1 = int(rows[0]), int(rows[-1]) + 1
+
+    # 1-pixel margin
+    c0 = max(0, c0 - 1)
+    c1 = min(len(x_coords), c1 + 1)
+    r0 = max(0, r0 - 1)
+    r1 = min(len(y_coords), r1 + 1)
+
+    try:
+        with h5py.File(h5_path, 'r') as f:
+            data = f[subdataset][r0:r1, c0:c1]
+    except Exception as e:
+        print(f'  ERROR reading HDF5 subset {h5_path}: {e}')
+        return False
+
+    if fill_nan:
+        if np.iscomplexobj(data):
+            data = np.where(np.isnan(data), 0 + 0j, data)
+        else:
+            data = np.nan_to_num(data, nan=0)
+
+    # Compute geotransform for subset
+    sub_x = x_coords[c0:c1]
+    sub_y = y_coords[r0:r1]
+    x_res = abs(sub_x[1] - sub_x[0]) if len(sub_x) > 1 else 1.0
+    dy_use = sub_y[1] - sub_y[0]     # preserve sign from coordinates
+    y0_use = float(sub_y[0])
+
+    gt = (float(sub_x[0]), x_res, 0, y0_use, 0, dy_use)
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(int(epsg))
+    proj_wkt = srs.ExportToWkt()
+
+    save_tiff(output_path, data, gt, proj_wkt)
+    return True
+
+
+def _crop_geotiff(tif_path, output_path, wsen_buf):
+    """Crop GeoTIFF file using GDAL Warp."""
+    ds = gdal.Open(tif_path)
+    if ds is None:
+        print(f'  ERROR opening {tif_path}')
+        return False
+
+    # Get file extent in EPSG:4326
+    gt = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    cols, rows = ds.RasterXSize, ds.RasterYSize
+
+    # Compute file extent in native CRS
+    f_W = gt[0]
+    f_N = gt[3]
+    f_E = f_W + gt[1] * cols
+    f_S = f_N + gt[5] * rows
+
+    if proj:
+        src_srs = osr.SpatialReference(); src_srs.ImportFromWkt(proj)
+        dst_srs = osr.SpatialReference(); dst_srs.ImportFromEPSG(4326)
+        if not src_srs.IsSame(dst_srs):
+            t = osr.CoordinateTransformation(src_srs, dst_srs)
+            sw = t.TransformPoint(f_W, f_S)
+            ne = t.TransformPoint(f_E, f_N)
+            f_ext_W, f_ext_S = sw[1], sw[0]
+            f_ext_E, f_ext_N = ne[1], ne[0]
+        else:
+            f_ext_W, f_ext_S, f_ext_E, f_ext_N = f_W, f_S, f_E, f_N
+    else:
+        f_ext_W, f_ext_S, f_ext_E, f_ext_N = f_W, f_S, f_E, f_N
+
+    # Intersect
+    inter_W = max(f_ext_W, wsen_buf[0])
+    inter_S = max(f_ext_S, wsen_buf[1])
+    inter_E = min(f_ext_E, wsen_buf[2])
+    inter_N = min(f_ext_N, wsen_buf[3])
+
+    if inter_W >= inter_E or inter_S >= inter_N:
+        ds = None
+        print(f'  skip (no overlap): {Path(tif_path).name}')
+        return True
+
+    warp_opts = gdal.WarpOptions(
+        outputBounds=(inter_W, inter_S, inter_E, inter_N),
+        outputBoundsSRS='EPSG:4326',
+        dstSRS=proj if proj else None,
+        format='GTiff',
+        creationOptions=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'],
+        resampleAlg='lanczos',
+    )
+    result = gdal.Warp(str(output_path), tif_path, options=warp_opts)
+    ds = None
+    if result is None:
+        print(f'  ERROR warping {tif_path}')
+        return False
+    result = None
+    return True
+
+
+# ===================================================================
+# 9. Interferogram pair list generation
+# ===================================================================
+
+def generate_ifgram_pairs(slc_dir, output_dir, n_connections=3):
+    """Generate sequential interferometric pair list from SLC directories.
+
+    Scans subdirectories under *slc_dir* for YYYYMMDD-formatted names,
+    generates sequential nearest-neighbor pairs, and writes
+    ``ifgram_list.txt`` to *output_dir*.
+
+    Parameters
+    ----------
+    slc_dir : str or Path
+        Top-level directory containing per-date SLC subdirectories.
+    output_dir : str or Path
+        Output directory for the pair list file.
+    n_connections : int
+        Number of nearest-neighbor connections (default 3).
+
+    Returns
+    -------
+    output_file : Path
+        Path to the generated ``ifgram_list.txt``.
+    """
+    slc_dir = Path(slc_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Collect dates from directory names
+    date_pattern = re.compile(r'^(\d{8})$')
+    dates = set()
+    for entry in sorted(slc_dir.iterdir()):
+        if entry.is_dir():
+            for sub in entry.iterdir():
+                if sub.is_dir() and date_pattern.match(sub.name):
+                    dates.add(sub.name)
+        elif entry.is_dir() and date_pattern.match(entry.name):
+            dates.add(entry.name)
+
+    # Also check for .slc.tif files with dates
+    if not dates:
+        for root, dirs, files in os.walk(str(slc_dir)):
+            for fname in files:
+                m = re.search(r'(\d{8})', fname)
+                if m:
+                    dates.add(m.group(1))
+            for dname in dirs:
+                if date_pattern.match(dname):
+                    dates.add(dname)
+
+    dates = sorted(dates)
+    print(f'Found {len(dates)} unique dates in {slc_dir}')
+
+    # Generate sequential pairs
+    pairs = []
+    max_step = min(n_connections + 1, len(dates))
+    for i in range(len(dates) - 1):
+        for j in range(i + 1, min(i + max_step, len(dates))):
+            pairs.append((dates[i], dates[j]))
+
+    print(f'Generated {len(pairs)} pairs (n_connections={n_connections})')
+
+    # Write output
+    output_file = output_dir / 'ifgram_list.txt'
+    with open(output_file, 'w') as f:
+        f.write('# Interferometric pairs\n')
+        f.write('# Date12\n')
+        for d1, d2 in sorted(pairs):
+            f.write(f'    {d1}-{d2}\n')
+
+    print(f'Wrote {len(pairs)} pairs to {output_file}')
+    return output_file
+
+
+# ===================================================================
+# 10. Single interferogram formation (numpy direct)
+# ===================================================================
+
+def form_single_ifgram(ref_slc, sec_slc, output_file):
+    """Form a complex interferogram from two geocoded SLC GeoTIFFs.
+
+    Since both SLCs are already geocoded and aligned to the same grid,
+    this computes ``ref * conj(sec)`` directly.
+
+    Parameters
+    ----------
+    ref_slc : str or Path
+        Path to the reference SLC GeoTIFF.
+    sec_slc : str or Path
+        Path to the secondary SLC GeoTIFF.
+    output_file : str or Path
+        Path for the output complex interferogram (.int.tif).
+
+    Returns
+    -------
+    output_file : Path or None
+    """
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists():
+        print(f'  skip (exists): {output_file.name}')
+        return output_file
+
+    ds_ref = gdal.Open(str(ref_slc))
+    ds_sec = gdal.Open(str(sec_slc))
+    if ds_ref is None or ds_sec is None:
+        print(f'  ERROR: cannot open {ref_slc} or {sec_slc}')
+        return None
+
+    ref_arr = ds_ref.GetRasterBand(1).ReadAsArray()
+    sec_arr = ds_sec.GetRasterBand(1).ReadAsArray()
+
+    if ref_arr.shape != sec_arr.shape:
+        if ds_ref.RasterXSize == ds_sec.RasterXSize and ds_ref.RasterYSize == ds_sec.RasterYSize:
+            ref_arr = ref_arr.astype(np.complex64)
+            sec_arr = sec_arr.astype(np.complex64)
+        else:
+            print(f'  ERROR: shape mismatch {ref_arr.shape} vs {sec_arr.shape}')
+            return None
+
+    ref_cx = ref_arr.astype(np.complex64)
+    sec_cx = sec_arr.astype(np.complex64)
+
+    ifg = ref_cx * np.conj(sec_cx)
+
+    gt = ds_ref.GetGeoTransform()
+    proj = ds_ref.GetProjection()
+
+    drv = gdal.GetDriverByName('GTiff')
+    out_ds = drv.Create(str(output_file), ds_ref.RasterXSize, ds_ref.RasterYSize,
+                        1, gdal.GDT_CFloat32,
+                        ['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'])
+    out_ds.SetGeoTransform(gt)
+    out_ds.SetProjection(proj)
+    out_ds.GetRasterBand(1).WriteArray(ifg)
+    out_ds = None
+    ds_ref = None
+    ds_sec = None
+
+    print(f'  created: {output_file.name}')
+    return output_file
+
+
+# ===================================================================
+# 11. Stitch interferograms (file I/O wrapper)
+# ===================================================================
+
+# ===================================================================
+# 8. SARForge pipeline replacements - single-file operations
+# ===================================================================
+
+def get_file_geo_metadata(tif_path):
+    """Read GDAL geotransform, projection, shape and EPSG from a GeoTIFF.
+
+    Parameters
+    ----------
+    tif_path : str or Path
+
+    Returns
+    -------
+    gt : tuple  GDAL geotransform (x0, dx, 0, y0, 0, dy).
+    proj_wkt : str
+    shape : tuple (rows, cols)
+    epsg : int or None
+    """
+    ds = gdal.Open(str(tif_path))
+    if ds is None:
+        raise FileNotFoundError(f'Cannot open {tif_path}')
+    gt = ds.GetGeoTransform()
+    proj_wkt = ds.GetProjection()
+    shape = (ds.RasterYSize, ds.RasterXSize)
+    epsg = None
+    if proj_wkt:
+        srs = osr.SpatialReference()
+        srs.ImportFromWkt(proj_wkt)
+        epsg = srs.GetAttrValue('AUTHORITY', 1)
+        if epsg is not None:
+            epsg = int(epsg)
+    ds = None
+    return gt, proj_wkt, shape, epsg
+
+
+def _get_hdf5_geo_metadata(h5_path, subdataset='/data/VV'):
+    """Read coordinate vectors and EPSG from an OPERA CSLC HDF5 file.
+
+    Returns (x_coords, y_coords, epsg, shape).
+    """
+    with h5py.File(h5_path, 'r') as f:
+        x = f['/data/x_coordinates'][:]
+        y = f['/data/y_coordinates'][:]
+        epsg = int(f['/data/projection'][()])
+        shape = f[subdataset].shape
+    return x, y, epsg, shape
+
+
+def crop_slc_single(input_file, output_file, wsen, buffer=0.0,
+                    fill_nan=False, subdataset='/data/VV'):
+    """Crop a single SLC file (HDF5 or GeoTIFF) to WSEN bounds + buffer.
+
+    Reads only the overlapping region from the input and writes a compact
+    GeoTIFF covering the intersection area.
+
+    Parameters
+    ----------
+    input_file : str or Path
+        Input file (HDF5 or GeoTIFF).
+    output_file : str or Path
+        Output cropped GeoTIFF.
+    wsen : tuple
+        (west, south, east, north) in EPSG:4326.
+    buffer : float
+        Buffer to add around wsen in degrees.
+    fill_nan : bool
+        Fill NaN values with 0.
+    subdataset : str
+        HDF5 subdataset path (for HDF5 inputs).
+
+    Returns
+    -------
+    bool
+        True on success, False on failure.
+    """
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists():
+        print(f'  skip (exists): {output_file.name}')
+        return True
+
+    wsen_buf = (wsen[0] - buffer, wsen[1] - buffer,
+                wsen[2] + buffer, wsen[3] + buffer)
+
+    input_file_str = str(input_file)
+
+    if input_file_str.endswith('.h5') or input_file_str.endswith('.hdf5'):
+        return _crop_hdf5(input_file_str, str(output_file), wsen_buf,
+                          subdataset, fill_nan)
+    else:
+        return _crop_geotiff(input_file_str, str(output_file), wsen_buf)
+
+
+def _crop_hdf5(h5_path, output_path, wsen_buf, subdataset, fill_nan):
+    """Crop HDF5 file: read only the overlap region, write GeoTIFF."""
+    try:
+        x_coords, y_coords, epsg, shape = _get_hdf5_geo_metadata(
+            h5_path, subdataset)
+    except Exception as e:
+        print(f'  ERROR reading HDF5 {h5_path}: {e}')
+        return False
+
+    if epsg and epsg != 4326:
+        src_srs = osr.SpatialReference(); src_srs.ImportFromEPSG(4326)
+        dst_srs = osr.SpatialReference(); dst_srs.ImportFromEPSG(int(epsg))
+        t = osr.CoordinateTransformation(src_srs, dst_srs)
+        corners = [
+            t.TransformPoint(wsen_buf[1], wsen_buf[0]),
+            t.TransformPoint(wsen_buf[3], wsen_buf[0]),
+            t.TransformPoint(wsen_buf[3], wsen_buf[2]),
+            t.TransformPoint(wsen_buf[1], wsen_buf[2]),
+        ]
+        native_W = min(c[0] for c in corners)
+        native_E = max(c[0] for c in corners)
+        native_S = min(c[1] for c in corners)
+        native_N = max(c[1] for c in corners)
+    else:
+        native_W, native_S, native_E, native_N = wsen_buf
+
+    col_mask = (x_coords >= native_W) & (x_coords <= native_E)
+    row_mask = (y_coords >= native_S) & (y_coords <= native_N)
+    if not np.any(col_mask) or not np.any(row_mask):
+        print(f'  skip (no overlap): {Path(h5_path).name}')
+        return True
+
+    cols = np.where(col_mask)[0]
+    rows = np.where(row_mask)[0]
+    c0, c1 = int(cols[0]), int(cols[-1]) + 1
+    r0, r1 = int(rows[0]), int(rows[-1]) + 1
+
+    c0 = max(0, c0 - 1)
+    c1 = min(len(x_coords), c1 + 1)
+    r0 = max(0, r0 - 1)
+    r1 = min(len(y_coords), r1 + 1)
+
+    try:
+        with h5py.File(h5_path, 'r') as f:
+            data = f[subdataset][r0:r1, c0:c1]
+    except Exception as e:
+        print(f'  ERROR reading HDF5 subset {h5_path}: {e}')
+        return False
+
+    if fill_nan:
+        if np.iscomplexobj(data):
+            data = np.where(np.isnan(data), 0 + 0j, data)
+        else:
+            data = np.nan_to_num(data, nan=0)
+
+    sub_x = x_coords[c0:c1]
+    sub_y = y_coords[r0:r1]
+    x_res = abs(sub_x[1] - sub_x[0]) if len(sub_x) > 1 else 1.0
+    dy_use = sub_y[1] - sub_y[0]     # preserve sign from coordinates
+    y0_use = float(sub_y[0])
+
+    gt = (float(sub_x[0]), x_res, 0, y0_use, 0, dy_use)
+
+    srs = osr.SpatialReference()
+    srs.ImportFromEPSG(int(epsg))
+    proj_wkt = srs.ExportToWkt()
+
+    save_tiff(output_path, data, gt, proj_wkt)
+    return True
+
+
+def _crop_geotiff(tif_path, output_path, wsen_buf):
+    """Crop GeoTIFF file using GDAL Warp."""
+    ds = gdal.Open(tif_path)
+    if ds is None:
+        print(f'  ERROR opening {tif_path}')
+        return False
+
+    gt = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    cols, rows = ds.RasterXSize, ds.RasterYSize
+
+    f_W = gt[0]
+    f_N = gt[3]
+    f_E = f_W + gt[1] * cols
+    f_S = f_N + gt[5] * rows
+
+    if proj:
+        src_srs = osr.SpatialReference(); src_srs.ImportFromWkt(proj)
+        dst_srs = osr.SpatialReference(); dst_srs.ImportFromEPSG(4326)
+        if not src_srs.IsSame(dst_srs):
+            t = osr.CoordinateTransformation(src_srs, dst_srs)
+            sw = t.TransformPoint(f_W, f_S)
+            ne = t.TransformPoint(f_E, f_N)
+            f_ext_W, f_ext_S = sw[1], sw[0]
+            f_ext_E, f_ext_N = ne[1], ne[0]
+        else:
+            f_ext_W, f_ext_S, f_ext_E, f_ext_N = f_W, f_S, f_E, f_N
+    else:
+        f_ext_W, f_ext_S, f_ext_E, f_ext_N = f_W, f_S, f_E, f_N
+
+    inter_W = max(f_ext_W, wsen_buf[0])
+    inter_S = max(f_ext_S, wsen_buf[1])
+    inter_E = min(f_ext_E, wsen_buf[2])
+    inter_N = min(f_ext_N, wsen_buf[3])
+
+    if inter_W >= inter_E or inter_S >= inter_N:
+        ds = None
+        print(f'  skip (no overlap): {Path(tif_path).name}')
+        return True
+
+    warp_opts = gdal.WarpOptions(
+        outputBounds=(inter_W, inter_S, inter_E, inter_N),
+        outputBoundsSRS='EPSG:4326',
+        dstSRS=proj if proj else None,
+        format='GTiff',
+        creationOptions=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'],
+        resampleAlg='lanczos',
+    )
+    result = gdal.Warp(str(output_path), tif_path, options=warp_opts)
+    ds = None
+    if result is None:
+        print(f'  ERROR warping {tif_path}')
+        return False
+    result = None
+    return True
+
+
+# ===================================================================
+# 9. Interferogram pair list generation
+# ===================================================================
+
+def generate_ifgram_pairs(slc_dir, output_dir, n_connections=3):
+    """Generate sequential interferometric pair list from SLC directories.
+
+    Scans subdirectories under *slc_dir* for YYYYMMDD-formatted names,
+    generates sequential nearest-neighbor pairs, and writes
+    ``ifgram_list.txt`` to *output_dir*.
+
+    Parameters
+    ----------
+    slc_dir : str or Path
+        Top-level directory containing per-date SLC subdirectories.
+    output_dir : str or Path
+        Output directory for the pair list file.
+    n_connections : int
+        Number of nearest-neighbor connections (default 3).
+
+    Returns
+    -------
+    output_file : Path
+        Path to the generated ``ifgram_list.txt``.
+    """
+    slc_dir = Path(slc_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    date_pattern = re.compile(r'^(\d{8})$')
+    dates = set()
+    for entry in sorted(slc_dir.iterdir()):
+        if entry.is_dir():
+            for sub in entry.iterdir():
+                if sub.is_dir() and date_pattern.match(sub.name):
+                    dates.add(sub.name)
+        elif entry.is_dir() and date_pattern.match(entry.name):
+            dates.add(entry.name)
+
+    if not dates:
+        for root, dirs, files in os.walk(str(slc_dir)):
+            for fname in files:
+                m = re.search(r'(\d{8})', fname)
+                if m:
+                    dates.add(m.group(1))
+            for dname in dirs:
+                if date_pattern.match(dname):
+                    dates.add(dname)
+
+    dates = sorted(dates)
+    print(f'Found {len(dates)} unique dates in {slc_dir}')
+
+    pairs = []
+    max_step = min(n_connections + 1, len(dates))
+    for i in range(len(dates) - 1):
+        for j in range(i + 1, min(i + max_step, len(dates))):
+            pairs.append((dates[i], dates[j]))
+
+    print(f'Generated {len(pairs)} pairs (n_connections={n_connections})')
+
+    output_file = output_dir / 'ifgram_list.txt'
+    with open(output_file, 'w') as f:
+        f.write('# Interferometric pairs\n')
+        f.write('# Date12\n')
+        for d1, d2 in sorted(pairs):
+            f.write(f'    {d1}-{d2}\n')
+
+    print(f'Wrote {len(pairs)} pairs to {output_file}')
+    return output_file
+
+
+# ===================================================================
+# 10. Single interferogram formation (numpy direct)
+# ===================================================================
+
+def form_single_ifgram(ref_slc, sec_slc, output_file):
+    """Form a complex interferogram from two geocoded SLC GeoTIFFs.
+
+    Since both SLCs are already geocoded and aligned to the same grid,
+    this computes ``ref * conj(sec)`` directly.
+
+    Parameters
+    ----------
+    ref_slc : str or Path
+        Path to the reference SLC GeoTIFF.
+    sec_slc : str or Path
+        Path to the secondary SLC GeoTIFF.
+    output_file : str or Path
+        Path for the output complex interferogram (.int.tif).
+
+    Returns
+    -------
+    output_file : Path or None
+    """
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists():
+        print(f'  skip (exists): {output_file.name}')
+        return output_file
+
+    ds_ref = gdal.Open(str(ref_slc))
+    ds_sec = gdal.Open(str(sec_slc))
+    if ds_ref is None or ds_sec is None:
+        print(f'  ERROR: cannot open {ref_slc} or {sec_slc}')
+        return None
+
+    ref_arr = ds_ref.GetRasterBand(1).ReadAsArray()
+    sec_arr = ds_sec.GetRasterBand(1).ReadAsArray()
+
+    if ref_arr.shape != sec_arr.shape:
+        print(f'  ERROR: shape mismatch {ref_arr.shape} vs {sec_arr.shape}')
+        return None
+
+    ifg = ref_arr.astype(np.complex64) * np.conj(sec_arr.astype(np.complex64))
+
+    gt = ds_ref.GetGeoTransform()
+    proj = ds_ref.GetProjection()
+
+    drv = gdal.GetDriverByName('GTiff')
+    out_ds = drv.Create(str(output_file), ds_ref.RasterXSize, ds_ref.RasterYSize,
+                        1, gdal.GDT_CFloat32,
+                        ['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'])
+    out_ds.SetGeoTransform(gt)
+    out_ds.SetProjection(proj)
+    out_ds.GetRasterBand(1).WriteArray(ifg)
+    out_ds = None
+    ds_ref = None
+    ds_sec = None
+
+    print(f'  created: {output_file.name}')
+    return output_file
+
+
+# ===================================================================
+# 11. Stitch interferograms
+# ===================================================================
+
+def stitch_ifgrams(burst_dir, out_bounds_wsen, output_dir,
+                   file_ext='.int.tif'):
+    """Stitch per-burst interferograms into unified products.
+
+    Reads per-burst GeoTIFFs with GDAL, computes union extent using
+    proper min/max, normalises dy convention, and passes to
+    :func:`stitch_arrays`.
+
+    Parameters
+    ----------
+    burst_dir : str or Path
+        Directory containing per-burst subdirectories.
+    out_bounds_wsen : tuple
+        (west, south, east, north) in EPSG:4326.
+    output_dir : str or Path
+        Output directory for stitched files.
+    file_ext : str
+        File extension to collect (default '.int.tif').
+
+    Returns
+    -------
+    ok : int
+    """
+    burst_dir = Path(burst_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    burst_pattern = re.compile(r'^t\d+_\d+_iw\d+$')
+    bursts = sorted(d for d in burst_dir.iterdir()
+                    if d.is_dir() and burst_pattern.match(d.name))
+
+    if not bursts:
+        print('No burst directories found.')
+        return 0
+
+    pair_files = {}
+    for burst_path in bursts:
+        for f in sorted(burst_path.glob(f'*{file_ext}')):
+            base = f.name.replace(file_ext, '')
+            if re.match(r'\d{8}_\d{8}', base):
+                pair_files.setdefault(base, []).append(f)
+
+    epsg_utm = 32605
+    for _, files in pair_files.items():
+        for fpath in files:
+            _, _, _, epsg = get_file_geo_metadata(fpath)
+            if epsg:
+                epsg_utm = epsg
+                break
+        break
+
+    ok = 0
+    for pair_name, file_list in sorted(pair_files.items()):
+        out_path = output_dir / f'{pair_name}{file_ext}'
+        if out_path.exists():
+            print(f'  skip (exists): {pair_name}')
+            ok += 1
+            continue
+
+        # Read files, compute extent correctly regardless of dy sign
+        pieces = []
+        proj_wkt = None
+        sample_dtype = None
+        for fp in file_list:
+            ds = gdal.Open(str(fp))
+            if ds is None:
+                continue
+            arr = ds.GetRasterBand(1).ReadAsArray()
+            if sample_dtype is None:
+                sample_dtype = arr.dtype
+            gt_in = ds.GetGeoTransform()
+            if proj_wkt is None:
+                proj_wkt = ds.GetProjection()
+            ds = None
+
+            x0, dx_p, _, y0, _, dy_p = gt_in
+            x1 = x0 + arr.shape[1] * dx_p
+            y1 = y0 + arr.shape[0] * dy_p
+            pieces.append({
+                'arr': arr, 'gt': gt_in,
+                'x_min': min(x0, x1), 'x_max': max(x0, x1),
+                'y_min': min(y0, y1), 'y_max': max(y0, y1),
+                'dx': dx_p, 'dy': dy_p,
+            })
+
+        if not pieces:
+            continue
+
+        dx_use, dy_use = pieces[0]['dx'], pieces[0]['dy']
+
+        # Union extent with proper min/max (matches sarforge)
+        ulx = min(p['x_min'] for p in pieces)
+        lrx = max(p['x_max'] for p in pieces)
+        uly = max(p['y_max'] for p in pieces)
+        lry = min(p['y_min'] for p in pieces)
+
+        # Normalise arrays to dy<0, stitch_arrays expects standard convention
+        arrays_list = []
+        for p in pieces:
+            arr = p['arr']
+            gt = p['gt']
+            if gt[5] > 0:
+                arr = np.flipud(arr)
+                x0_s, dx_s, _, y0_s, _, dy_s = gt
+                nrows = arr.shape[0]
+                y0_s = y0_s + (nrows - 1) * dy_s
+                dy_s = -dy_s
+                gt = (x0_s, dx_s, 0, y0_s, 0, dy_s)
+            arrays_list.append((arr, gt, proj_wkt))
+
+        try:
+            stitched, out_gt, out_wkt = stitch_arrays(
+                arrays_list, out_bounds_wsen,
+                epsg_utm=epsg_utm)
+            save_tiff(str(out_path), stitched, out_gt, out_wkt)
+            print(f'  stitched: {pair_name} ({len(file_list)} bursts)')
+            ok += 1
+        except Exception as e:
+            print(f'  ERROR stitching {pair_name}: {e}')
+
+    print(f'Stitched {ok}/{len(pair_files)} pairs')
+    return ok
+
+
+def _read_tif_array(tif_path):
+    """Read a GeoTIFF into a complex64 array with geotransform and WKT."""
+    ds = gdal.Open(str(tif_path))
+    arr = ds.GetRasterBand(1).ReadAsArray()
+    gt = ds.GetGeoTransform()
+    proj_wkt = ds.GetProjection()
+    ds = None
+    return arr.astype(np.complex64), gt, proj_wkt
+
+
+# ===================================================================
+# 12. Multilook TIF (file I/O wrapper)
+# ===================================================================
+
+def multilook_tif(input_tif, output_tif=None, lks_y=1, lks_x=1,
+                  method='mean'):
+    """Apply multilooking to a GDAL-readable GeoTIFF file.
+
+    Parameters
+    ----------
+    input_tif : str or Path
+        Path to input GeoTIFF.
+    output_tif : str or Path, optional
+        Output path. Auto-generated from input if None.
+    lks_y : int
+        Number of azimuth looks.
+    lks_x : int
+        Number of range looks.
+    method : str
+        'mean' or 'nearest'.
+
+    Returns
+    -------
+    output_tif : Path or None
+    """
+    input_tif = Path(input_tif)
+
+    if output_tif is None:
+        output_tif = input_tif.parent / f'multilooked_{input_tif.name}'
+    output_tif = Path(output_tif)
+
+    if output_tif.exists():
+        print(f'  skip (exists): {output_tif.name}')
+        return output_tif
+
+    output_tif.parent.mkdir(parents=True, exist_ok=True)
+
+    ds = gdal.Open(str(input_tif))
+    if ds is None:
+        print(f'  ERROR opening {input_tif}')
+        return None
+
+    band_count = ds.RasterCount
+    bands = [ds.GetRasterBand(i + 1).ReadAsArray() for i in range(band_count)]
+    gt = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    ds = None
+
+    if lks_y * lks_x == 1:
+        for b in range(band_count):
+            save_tiff(str(output_tif), bands[b], gt, proj)
+        return output_tif
+
+    ml_bands = []
+    for bdata in bands:
+        nr, nc = bdata.shape
+        nr = nr - nr % lks_y
+        nc = nc - nc % lks_x
+        if method == 'nearest':
+            ml = bdata[int(lks_y/2)::lks_y, int(lks_x/2)::lks_x]
+        else:
+            ml = bdata[:nr, :nc].reshape(
+                nr // lks_y, lks_y, nc // lks_x, lks_x).mean(axis=(1, 3))
+        ml_bands.append(ml)
+
+    new_gt = (gt[0], gt[1] * lks_x, gt[2], gt[3], gt[4], gt[5] * lks_y)
+
+    if band_count == 1:
+        save_tiff(str(output_tif), ml_bands[0], new_gt, proj)
+    else:
+        for b in range(band_count):
+            save_tiff(str(output_tif), ml_bands[b], new_gt, proj)
+
+    print(f'  multilooked: {input_tif.name} -> {output_tif.name}')
+    return output_tif
+
+
+# ===================================================================
+# 13. Goldstein filter TIF (file I/O wrapper)
+# ===================================================================
+
+def filter_tif(input_tif, output_tif=None, alpha=0.5, psize=32):
+    """Apply Goldstein adaptive phase filter to a GeoTIFF interferogram.
+
+    Parameters
+    ----------
+    input_tif : str or Path
+        Path to complex interferogram GeoTIFF.
+    output_tif : str or Path, optional
+        Output path. Auto-generated if None.
+    alpha : float
+        Filter exponent [0, 1].
+    psize : int
+        FFT patch size.
+
+    Returns
+    -------
+    output_tif : Path or None
+    """
+    input_tif = Path(input_tif)
+
+    if output_tif is None:
+        output_tif = input_tif.parent / f'filtered_{input_tif.name}'
+    output_tif = Path(output_tif)
+
+    if output_tif.exists():
+        print(f'  skip (exists): {output_tif.name}')
+        return output_tif
+
+    output_tif.parent.mkdir(parents=True, exist_ok=True)
+
+    ds = gdal.Open(str(input_tif))
+    if ds is None:
+        print(f'  ERROR opening {input_tif}')
+        return None
+
+    arr = ds.GetRasterBand(1).ReadAsArray().astype(np.complex64)
+    gt = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    ds = None
+
+    nodata = np.abs(arr) < 1e-6
+    filtered = goldstein_filter(arr, alpha=alpha, psize=psize,
+                                nodata_mask=nodata)
+
+    save_tiff(str(output_tif), filtered, gt, proj)
+    print(f'  filtered: {input_tif.name} -> {output_tif.name}')
+    return output_tif
+
+
+# ===================================================================
+# 14. Phase-sigma coherence TIF (file I/O wrapper)
+# ===================================================================
+
+def generate_phsig_coh_tif(input_tif, output_tif=None, nlks=8):
+    """Compute phase-sigma correlation from a complex interferogram TIF.
+
+    Parameters
+    ----------
+    input_tif : str or Path
+        Path to complex interferogram GeoTIFF.
+    output_tif : str or Path, optional
+        Output path. Auto-generated if None.
+    nlks : float
+        Number of looks for correlation conversion.
+
+    Returns
+    -------
+    output_tif : Path or None
+    """
+    input_tif = Path(input_tif)
+
+    if output_tif is None:
+        base = input_tif.name.replace('.int.tif', '').replace('.int', '')
+        for prefix in ['filtered_', 'multilooked_', 'filtered_multilooked_']:
+            if base.startswith(prefix):
+                base = base[len(prefix):]
+        output_tif = input_tif.parent / f'{base}.phsig.coh.tif'
+    output_tif = Path(output_tif)
+
+    if output_tif.exists():
+        print(f'  skip (exists): {output_tif.name}')
+        return output_tif
+
+    output_tif.parent.mkdir(parents=True, exist_ok=True)
+
+    ds = gdal.Open(str(input_tif))
+    if ds is None:
+        print(f'  ERROR opening {input_tif}')
+        return None
+
+    arr = ds.GetRasterBand(1).ReadAsArray().astype(np.complex64)
+    gt = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    ds = None
+
+    coh = estimate_phsig_correlation(arr, nlks=nlks)
+
+    save_tiff(str(output_tif), coh.astype(np.float32), gt, proj)
+    print(f'  phsig coh: {input_tif.name} -> {output_tif.name}')
+    return output_tif
+
+
+# ===================================================================
+# 15. Single interferogram unwrapping (snaphu-py)
+# ===================================================================
+
+def unwrap_single_ifgram(ifg_file, corr_file, output_file,
+                         nlooks=8, cost_mode='smooth',
+                         init_method='mcf', water_mask_dir=None):
+    """Unwrap a single interferogram using snaphu-py.
+
+    Parameters
+    ----------
+    ifg_file : str or Path
+        Path to complex interferogram GeoTIFF.
+    corr_file : str or Path
+        Path to correlation/coherence GeoTIFF.
+    output_file : str or Path
+        Output path for unwrapped phase GeoTIFF.
+    nlooks : int
+        Number of looks (for snaphu stat cost).
+    cost_mode : str
+        SNAPHU cost mode: 'smooth', 'defo', etc.
+    init_method : str
+        SNAPHU init method: 'mcf', 'mst'.
+    water_mask_dir : str or Path, optional
+        Directory containing ``swbd_nasadem.wbd`` + ``swbd_nasadem.json``.
+        If provided, water pixels are masked out before unwrapping.
+
+    Returns
+    -------
+    output_file : Path or None
+    """
+    import snaphu
+
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists():
+        print(f'  skip (exists): {output_file.name}')
+        return output_file
+
+    ds = gdal.Open(str(ifg_file))
+    if ds is None:
+        print(f'  ERROR opening {ifg_file}')
+        return None
+    ifg = ds.GetRasterBand(1).ReadAsArray().astype(np.complex64)
+    gt = ds.GetGeoTransform()
+    proj = ds.GetProjection()
+    ds = None
+
+    ds = gdal.Open(str(corr_file))
+    if ds is None:
+        print(f'  ERROR opening {corr_file}')
+        return None
+    corr = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+    ds = None
+
+    amp = np.abs(ifg)
+    mask = (amp < 1e-6)
+
+    if water_mask_dir is not None:
+        epsg_ifg = None
+        if proj:
+            srs_ifg = osr.SpatialReference()
+            srs_ifg.ImportFromWkt(proj)
+            epsg_ifg = int(srs_ifg.GetAttrValue('AUTHORITY', 1))
+        if epsg_ifg:
+            wbd_mask = load_water_mask(gt, ifg.shape, epsg_ifg,
+                                       wbd_dir=water_mask_dir)
+            if wbd_mask.shape == ifg.shape:
+                ifg[wbd_mask] = 0
+                mask = mask | wbd_mask
+                wbd_pct = 100 * wbd_mask.sum() / wbd_mask.size
+                print(f'  water mask: {wbd_pct:.1f}% of grid')
+            else:
+                print(f'  WARNING: water mask shape {wbd_mask.shape} != '
+                      f'ifg shape {ifg.shape}, skipping')
+
+    try:
+        unw, conncomp = snaphu.unwrap(
+            ifg, corr,
+            nlooks=float(nlooks),
+            cost=cost_mode,
+            init=init_method,
+            mask=mask,
+        )
+    except Exception as e:
+        print(f'  SNAPHU error for {ifg_file}: {e}')
+        return None
+
+    unw[mask] = 0.0
+    conncomp[mask] = 0
+
+    save_tiff(str(output_file), unw.astype(np.float32), gt, proj)
+
+    conncomp_file = output_file.with_suffix('.unw.conncomp.tif')
+    if output_file.suffix == '.tif':
+        conncomp_file = Path(str(output_file).replace('.unw.tif',
+                                                        '.unw.conncomp.tif'))
+    save_tiff(str(conncomp_file), conncomp.astype(np.uint16), gt, proj)
+
+    print(f'  unwrapped: {ifg_file.name} -> {output_file.name}')
+    return output_file
+
+
+# ===================================================================
+# 16. Baseline computation (ported from compute_baseline.py)
+# ===================================================================
+
+def find_slc_files_for_baseline(slc_dir):
+    """Find SLC files (.zip or .SAFE) and return sorted (date, path) list."""
+    slc_dir = Path(slc_dir)
+    slc_files = []
+
+    date_pat = re.compile(r'_(\d{8})T\d{6}_')
+
+    for f in sorted(slc_dir.glob('*.zip')):
+        m = date_pat.search(f.name)
+        if m:
+            slc_files.append((m.group(1), str(f)))
+
+    for f in sorted(slc_dir.glob('*.SAFE')):
+        m = date_pat.search(f.name)
+        if m:
+            slc_files.append((m.group(1), str(f)))
+
+    return sorted(slc_files, key=lambda x: x[0])
+
+
+def find_eof_file_for_date(orbit_dir, ymd):
+    """Find an EOF orbit file covering the given YYYYMMDD date."""
+    orbit_path = Path(orbit_dir)
+    if not orbit_path.exists():
+        return None
+
+    try:
+        from datetime import datetime
+        target_date = datetime.strptime(ymd, '%Y%m%d')
+    except ValueError:
+        return None
+
+    for eof in sorted(orbit_path.glob('*.EOF')):
+        m = re.search(r'V(\d{8}T\d{6})_(\d{8}T\d{6})', eof.name)
+        if m:
+            try:
+                start = datetime.strptime(m.group(1), '%Y%m%dT%H%M%S')
+                end = datetime.strptime(m.group(2), '%Y%m%dT%H%M%S')
+                if start.date() <= target_date.date() <= end.date():
+                    return str(eof)
+            except ValueError:
+                continue
+
+    eofs = sorted(orbit_path.glob('*.EOF'))
+    return str(eofs[0]) if eofs else None
+
+
+def compute_baseline_pair(ref_burst, sec_burst, dem_path=None,
+                          look_direction='right'):
+    """Compute parallel and perpendicular baselines for a burst pair.
+
+    Parameters
+    ----------
+    ref_burst, sec_burst : s1reader burst objects
+    dem_path : str, optional
+    look_direction : str
+        'right' or 'left'.
+
+    Returns
+    -------
+    B_par, B_perp : float
+        Parallel and perpendicular baselines (metres).
+    """
+    from isce3.core import Ellipsoid, LookSide
+    from isce3.geometry import DEMInterpolator, rdr2geo_bracket, geo2rdr_bracket
+
+    tmid = ref_burst.sensing_mid
+    rng = ref_burst.starting_range + (ref_burst.width / 2) * ref_burst.range_pixel_spacing
+    wavelength = ref_burst.wavelength
+
+    ref_orbit = ref_burst.orbit
+    sec_orbit = sec_burst.orbit
+    ref_doppler = ref_burst.doppler.lut2d
+    sec_doppler = sec_burst.doppler.lut2d
+
+    look_side = LookSide.Right if look_direction.lower() == 'right' else LookSide.Left
+
+    if dem_path and os.path.exists(dem_path):
+        dem_interp = DEMInterpolator(-500, 'bilinear')
+        from isce3.io import Raster; dem_interp.load_dem(Raster(dem_path))
+        dem_interp.compute_min_max_mean_height()
+    else:
+        dem_interp = DEMInterpolator()
+
+    ellipsoid = Ellipsoid()
+
+    ref_epoch_py = _isce3_datetime_to_python(ref_orbit.reference_epoch)
+    t_sec_ref = (tmid - ref_epoch_py).total_seconds()
+
+    t_dop = t_sec_ref
+    if t_dop < ref_doppler.y_start or t_dop > ref_doppler.y_end:
+        t_dop = (ref_doppler.y_start + ref_doppler.y_end) / 2
+    if rng < ref_doppler.x_start or rng > ref_doppler.x_end:
+        rng = (ref_doppler.x_start + ref_doppler.x_end) / 2
+
+    ref_dop_val = ref_doppler.eval(t_dop, rng)
+
+    llh = rdr2geo_bracket(t_sec_ref, rng, ref_orbit, look_side,
+                          ref_dop_val, wavelength, dem_interp)
+
+    slv_time, slv_rng = geo2rdr_bracket(llh, sec_orbit, sec_doppler,
+                                        wavelength, look_side)
+
+    ref_sv = ref_orbit.interpolate(float(t_sec_ref))
+    sec_sv = sec_orbit.interpolate(float(slv_time))
+
+    ref_pos = np.array(ref_sv[0])
+    sec_pos = np.array(sec_sv[0])
+    ref_vel = np.array(ref_sv[1])
+
+    aa = np.linalg.norm(sec_pos - ref_pos)
+    costheta = (rng * rng + aa * aa - slv_rng * slv_rng) / (2.0 * rng * aa)
+
+    B_par = aa * costheta
+    perp = aa * np.sqrt(1 - costheta * costheta)
+
+    targ_xyz = np.array(ellipsoid.lon_lat_to_xyz(llh))
+    direction = np.sign(np.dot(np.cross(targ_xyz - ref_pos, sec_pos - ref_pos),
+                               ref_vel))
+    B_perp = direction * perp
+
+    return B_par, B_perp
+
+
+def _isce3_datetime_to_python(dt):
+    """Convert isce3.core.DateTime to python datetime."""
+    from datetime import datetime
+    return datetime(dt.year, dt.month, dt.day,
+                    dt.hour, dt.minute, dt.second,
+                    int(dt.frac * 1e6))
+
+
+def compute_baselines_for_bursts(slc_dir, burst_ids, output_base,
+                                 dem_path=None, orbit_dir=None,
+                                 look_direction='right'):
+    """Compute baselines for multiple bursts from SLC files.
+
+    Scans SLC files (SAFE .zip or .SAFE directories), finds matching
+    bursts, and computes parallel/perpendicular baselines relative to
+    the earliest date for each burst.
+
+    Parameters
+    ----------
+    slc_dir : str or Path
+        Directory containing SLC files (.zip or .SAFE).
+    burst_ids : list of str
+        Burst identifiers, e.g. ['t124_264305_iw2', ...].
+    output_base : str or Path
+        Base output directory (per-burst subdirectories created).
+    dem_path : str, optional
+        Path to DEM GeoTIFF.
+    orbit_dir : str, optional
+        Directory containing orbit EOF files.
+    look_direction : str
+        'right' or 'left'.
+
+    Returns
+    -------
+    ok : int
+        Number of successfully computed pairs.
+    """
+    import s1reader
+
+    all_slc = find_slc_files_for_baseline(slc_dir)
+    if not all_slc:
+        print(f'No SLC files found in {slc_dir}')
+        return 0
+
+    from collections import defaultdict
+    slc_by_date = defaultdict(list)
+    for date_str, path_str in all_slc:
+        slc_by_date[date_str].append(path_str)
+    dates = sorted(slc_by_date.keys())
+    print(f'Found {len(all_slc)} SLC files across {len(dates)} dates')
+
+    output_base = Path(output_base)
+    total_ok = 0
+
+    for burst_id in burst_ids:
+        print(f'\nProcessing burst: {burst_id}')
+        swath_num = int(burst_id.split('_')[-1][-1])
+
+        out_dir = output_base / burst_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        slc_for_dates = {}
+        for date_str in dates:
+            for slc_path in slc_by_date[date_str]:
+                eof = find_eof_file_for_date(orbit_dir, date_str) if orbit_dir else None
+                try:
+                    bursts = s1reader.load_bursts(
+                        slc_path, eof, swath_num, burst_ids=[burst_id])
+                    if bursts:
+                        slc_for_dates[date_str] = (slc_path, bursts[0])
+                        print(f'  {date_str}: {Path(slc_path).name}')
+                        break
+                except Exception:
+                    continue
+
+        if len(slc_for_dates) < 2:
+            print(f'  Need >= 2 dates, got {len(slc_for_dates)}. Skipping.')
+            continue
+
+        ref_date = min(slc_for_dates.keys())
+        _, ref_burst = slc_for_dates.pop(ref_date)
+        print(f'  Reference: {ref_date}')
+
+        burst_ok = 0
+        for sec_date in sorted(slc_for_dates.keys()):
+            _, sec_burst = slc_for_dates[sec_date]
+            try:
+                B_par, B_perp = compute_baseline_pair(
+                    ref_burst, sec_burst, dem_path, look_direction)
+
+                out_file = out_dir / f'{ref_date}_{sec_date}.txt'
+                with open(out_file, 'w') as f:
+                    f.write(f'Bperp (m): {B_perp:.3f}\n')
+                    f.write(f'Bpar (m): {B_par:.3f}\n')
+
+                print(f'  {ref_date}-{sec_date}: B_par={B_par:.3f}, B_perp={B_perp:.3f}')
+                burst_ok += 1
+                total_ok += 1
+            except Exception as e:
+                print(f'  ERROR {ref_date}-{sec_date}: {e}')
+
+    print(f'\nBaseline computation done: {total_ok} pairs')
+    return total_ok
+
+
+# ===================================================================
+# 17. Merge baselines (ported from merge.py baseline mode)
+# ===================================================================
+
+def merge_baselines(baseline_dir, output_dir):
+    """Merge per-burst baseline text files into MintPy-compatible format.
+
+    Reads ``Bperp (m)`` / ``Bpar (m)`` from per-burst ``REFDATE_SECDATE.txt``
+    files and merges them into a single baseline file per date pair.
+
+    Parameters
+    ----------
+    baseline_dir : str or Path
+        Directory containing per-burst baseline subdirectories.
+    output_dir : str or Path
+        Output directory for merged baseline files.
+
+    Returns
+    -------
+    ok : int
+        Number of merged pairs.
+    """
+    baseline_dir = Path(baseline_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    burst_pattern = re.compile(r'^t\d+_\d+_iw\d+$')
+    burst_dirs = sorted(d for d in baseline_dir.iterdir()
+                        if d.is_dir() and burst_pattern.match(d.name))
+
+    if not burst_dirs:
+        print('No burst baseline directories found.')
+        return 0
+
+    pair_data = {}
+    for bd in burst_dirs:
+        for f in bd.glob('*.txt'):
+            name = f.stem
+            m = re.match(r'(\d{8})_(\d{8})', name)
+            if not m:
+                continue
+            pair_key = name
+            try:
+                with open(f) as fh:
+                    d = {}
+                    for line in fh:
+                        line = line.strip()
+                        if line.startswith('Bperp'):
+                            d['Bperp'] = float(line.split(':')[1].strip())
+                        elif line.startswith('Bpar'):
+                            d['Bpar'] = float(line.split(':')[1].strip())
+                pair_data.setdefault(pair_key, []).append(d)
+            except Exception:
+                continue
+
+    ok = 0
+    for pair_key, values in sorted(pair_data.items()):
+        out_file = output_dir / f'{pair_key}.txt'
+        if out_file.exists():
+            print(f'  skip (exists): {pair_key}')
+            ok += 1
+            continue
+
+        Bperp = np.mean([v['Bperp'] for v in values])
+        Bpar = np.mean([v['Bpar'] for v in values])
+
+        with open(out_file, 'w') as f:
+            f.write(f'Bperp (m): {Bperp:.3f}\n')
+            f.write(f'Bpar (m): {Bpar:.3f}\n')
+
+        print(f'  merged: {pair_key} ({len(values)} bursts)')
+        ok += 1
+
+    print(f'Merged {ok}/{len(pair_data)} pairs')
     return ok
