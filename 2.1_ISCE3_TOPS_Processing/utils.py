@@ -216,7 +216,7 @@ def extract_burst_slc(safe_path, burst_id):
     tree = etree.parse(ann_file)
     root = tree.getroot()
 
-    _REL_ORBIT_OFFSET = {'S1A': 73, 'S1B': 27}
+    _REL_ORBIT_OFFSET = {'S1A': 73, 'S1B': 27, 'S1C': 27, 'S1D': 27}
     mission_id = root.find('.//{*}missionId').text
     abs_orbit = int(root.find('.//{*}absoluteOrbitNumber').text)
     offset = _REL_ORBIT_OFFSET.get(mission_id, 73)
@@ -271,7 +271,8 @@ def extract_burst_slc(safe_path, burst_id):
 def compute_static_troposphere_delay(incidence_angle_arr, hgt_arr):
     """Compute troposphere delay using static model.
 
-    Identical to ``compass.utils.lut::compute_static_troposphere_delay()``.
+    Identical to ``compass.utils.lut::compute_static_troposphere_delay()``
+    (COMPASS v0.5.7+).
 
     Parameters
     ----------
@@ -1286,8 +1287,8 @@ def discover_burst_ids(safe_base, date_ymd_list):
     date_list : list of str
         Dates as ``YYYY-MM-DD`` for each burst.
     """
-    # Relative orbit offsets: S1A = 73, S1B = 27
-    _REL_ORBIT_OFFSET = {'S1A': 73, 'S1B': 27}
+    # Relative orbit offsets: S1A = 73, S1B = 27, S1C = 27, S1D = 27
+    _REL_ORBIT_OFFSET = {'S1A': 73, 'S1B': 27, 'S1C': 27, 'S1D': 27}
 
     safe_base = Path(safe_base)
     burst_id_set = set()
